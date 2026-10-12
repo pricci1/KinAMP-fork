@@ -34,8 +34,9 @@ private:
     AVPacket* packet = nullptr;
     int stream = -1;
     bool draining = false;
+    bool have_frame = false;
     int64_t origin = 0;
     int64_t duration = 0;
-    int64_t target = 0;
+    int64_t cursor = 0;
 };
 #endif

@@ -33,7 +33,11 @@ bool OpusMp4::open(const char* path) {
     if (stream < 0 || fmt->streams[stream]->codecpar->codec_id != AV_CODEC_ID_OPUS) return false;
 
     AVStream* st = fmt->streams[stream];
-    codec = avcodec_alloc_context3(avcodec_find_decoder(AV_CODEC_ID_OPUS));
+    // Packet-aligned output is required for presentation timestamps. Native
+    // FFmpeg Opus can return delayed SILK samples under a later packet's PTS.
+    const AVCodec* decoder = avcodec_find_decoder_by_name("libopus");
+    if (!decoder) return false;
+    codec = avcodec_alloc_context3(decoder);
     if (!codec || avcodec_parameters_to_context(codec, st->codecpar) < 0) return false;
     codec->pkt_timebase = st->time_base;
     if (avcodec_open2(codec, nullptr, nullptr) < 0) return false;
@@ -52,11 +56,17 @@ bool OpusMp4::open(const char* path) {
 }
 
 int OpusMp4::seek(int64_t sample) {
-    target = std::max<int64_t>(0, sample);
-    // Decode at least 80 ms before the requested presentation sample. Seeking
-    // directly to the packet containing the target loses Opus predictor state.
-    int64_t preroll = std::max<int64_t>(0, target - 3840);
-    int64_t timestamp = origin + av_rescale_q(preroll, AVRational{1, 48000}, fmt->streams[stream]->time_base);
+    cursor = std::max<int64_t>(0, sample);
+    AVStream* st = fmt->streams[stream];
+    int64_t timestamp = origin + av_rescale_q(cursor, AVRational{1, 48000}, st->time_base);
+    // A timestamp backstep can land inside a gap and warm up just one packet.
+    // MOV's sample index lets us back up by coded packets instead. Every Opus
+    // packet contains >=2.5 ms: 32 packets guarantee >=80 ms of decoder history,
+    // bounded by 3.84 s for 120-ms packets. This also spans mode transitions.
+    int index = av_index_search_timestamp(st, timestamp, AVSEEK_FLAG_BACKWARD);
+    const AVIndexEntry* entry = avformat_index_get_entry(st, std::max(0, index - 32));
+    if (index < 0 || !entry) return AVERROR_INVALIDDATA;
+    timestamp = entry->timestamp;
     int result = av_seek_frame(fmt, stream, timestamp, AVSEEK_FLAG_BACKWARD);
     if (result < 0) return result;
     avcodec_flush_buffers(codec);
@@ -65,13 +75,15 @@ int OpusMp4::seek(int64_t sample) {
     av_packet_unref(packet);
     av_frame_unref(frame);
     draining = false;
+    have_frame = false;
     return result;
 }
 
 int OpusMp4::read(std::vector<int16_t>& pcm) {
     pcm.clear();
     while (true) {
-        int result = avcodec_receive_frame(codec, frame);
+        if (duration > 0 && cursor >= duration) return 0;
+        int result = have_frame ? 0 : avcodec_receive_frame(codec, frame);
         if (result == AVERROR_EOF) return 0;
         if (result == AVERROR(EAGAIN)) {
             if (draining) return AVERROR_INVALIDDATA;
@@ -91,22 +103,34 @@ int OpusMp4::read(std::vector<int16_t>& pcm) {
             continue;
         }
         if (result < 0) return result;
+        have_frame = true;
         if (frame->best_effort_timestamp == AV_NOPTS_VALUE) return AVERROR_INVALIDDATA;
         int64_t begin = av_rescale_q(frame->best_effort_timestamp - origin,
                                     fmt->streams[stream]->time_base, AVRational{1, 48000});
+        // Retain the frame while filling a presentation gap in bounded chunks.
+        // On overlap, already-presented samples win; do not append them twice.
+        if (begin > cursor) {
+            int64_t end = duration > 0 ? std::min(begin, duration) : begin;
+            int count = static_cast<int>(std::min<int64_t>(960, end - cursor));
+            pcm.assign(count * 2, 0);
+            cursor += count;
+            return count;
+        }
         pcm.resize(frame->nb_samples * 2);
         uint8_t* out = reinterpret_cast<uint8_t*>(pcm.data());
         int count = swr_convert(swr, &out, frame->nb_samples,
                                 const_cast<const uint8_t**>(frame->extended_data), frame->nb_samples);
         av_frame_unref(frame);
+        have_frame = false;
         if (count < 0) return count;
         // MP4 edit lists may trim the last packet without discard side data.
         // Enforce the presentation duration, not the encoded packet duration.
-        int skip = static_cast<int>(std::min<int64_t>(count, std::max<int64_t>(0, target - begin)));
+        int skip = static_cast<int>(std::min<int64_t>(count, cursor - begin));
         if (duration > 0) count = static_cast<int>(std::min<int64_t>(count, std::max<int64_t>(0, duration - begin)));
         if (count <= skip) continue;
         pcm.erase(pcm.begin(), pcm.begin() + skip * 2);
         pcm.resize((count - skip) * 2);
+        cursor += count - skip;
         return count - skip;
     }
 }

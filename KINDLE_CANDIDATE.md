@@ -5,6 +5,12 @@ No runner/device was contacted and nothing was installed, pushed or published.
 Native ownership remains with the source thread/user. The original host and
 Debian/QEMU artifacts and evidence are preserved unchanged.
 
+**v2 supersedes this candidate:** [TIMELINE_CORRECTION.md](TIMELINE_CORRECTION.md)
+records the generic overlap/gap correction, static libopus build, new sizes and
+expanded synthetic verification. The v1 measurements below are historical.
+Native player acceptance remains blocked pending owner-side tests and timing
+investigation; no private-file cause has been established.
+
 ## Corrected target evidence and toolchain choice
 
 The private library inventory supplied for Paperwhite 6 / firmware 5.19.3.0.1

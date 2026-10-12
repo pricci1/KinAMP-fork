@@ -8,7 +8,7 @@ upstream=$(realpath "$3")
 cross=${4:-}
 source=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 mkdir -p "$out"
-export PKG_CONFIG_LIBDIR="$ffmpeg/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$ffmpeg/lib/pkgconfig:$ffmpeg/opus/lib/pkgconfig"
 "${cross}g++" ${CXXFLAGS:-} -Os -std=c++11 -I"$source" "$source/tests/opus_pcm.cpp" "$source/opus_mp4.cpp" \
     $(pkg-config --cflags --libs --static libavformat libavcodec libswresample libavutil) ${LDFLAGS:-} -o "$out/opus-pcm"
 for file in mp4read audio unicode_support; do

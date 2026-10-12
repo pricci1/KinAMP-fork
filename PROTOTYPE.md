@@ -4,6 +4,11 @@ This is review/build material, **not a Kindle installation package**. Nothing
 was pushed, published, deployed, or installed on a Kindle/runner. KoReadalong
 code and books were not changed. All media in this experiment is synthetic.
 
+**v2 correction:** [TIMELINE_CORRECTION.md](TIMELINE_CORRECTION.md) supersedes
+the native-Opus decoder/design and measurements below with static libopus,
+explicit overlap/gap accounting and coded-packet preroll. Earlier artifacts
+remain historical; native player acceptance is blocked, not passed.
+
 **Target-linked continuation:** [KINDLE_CANDIDATE.md](KINDLE_CANDIDATE.md) records
 the supplied Paperwhite 6 library inventory, corrected GLIBC/GLIBCXX premise,
 new target-linked build/preflight, and owner-only native acceptance procedure.
@@ -60,7 +65,7 @@ git submodule update --init
 git worktree add --detach ../upstream 91b661cd9ffdd022e9af698b071256426c81351b
 git -C ../upstream submodule update --init
 scripts/build-opus-ffmpeg.sh ../ffmpeg-host
-PKG_CONFIG_PATH="$(realpath ../ffmpeg-host)/lib/pkgconfig" \
+PKG_CONFIG_PATH="$(realpath ../ffmpeg-host)/lib/pkgconfig:$(realpath ../ffmpeg-host)/opus/lib/pkgconfig" \
   cmake -S . -B ../build-host -DGST10=ON -DKINAMP_MINIMAL_ONLY=ON \
     -DKINAMP_OPUS_MP4=ON -DCMAKE_BUILD_TYPE=MinSizeRel
 cmake --build ../build-host --target KinAMP-minimal -j4

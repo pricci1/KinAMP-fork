@@ -104,7 +104,7 @@ cp "$out/gst-config/pkgconfig/gstreamer.pc" "$PKG_CONFIG_LIBDIR/gstreamer-0.10.p
 find "$out/headers" -name neaacdec.h -exec cp {} "$sysroot/usr/include/" \;
 KINAMP_BUILD_CACHE="$cache" "$source/scripts/build-opus-ffmpeg.sh" \
     "$out/ffmpeg" arm-linux-gnueabihf- "$sysroot"
-export PKG_CONFIG_LIBDIR="$out/ffmpeg/lib/pkgconfig:$sysroot/usr/lib/pkgconfig"
+export PKG_CONFIG_LIBDIR="$out/ffmpeg/lib/pkgconfig:$out/ffmpeg/opus/lib/pkgconfig:$sysroot/usr/lib/pkgconfig"
 # FFmpeg's prefix is outside the sysroot: pkg-config must not prepend it again.
 export PKG_CONFIG_SYSROOT_DIR=
 cmake --fresh -S "$source" -B "$out/player" \

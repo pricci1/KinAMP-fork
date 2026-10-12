@@ -54,6 +54,33 @@ def fixtures(work):
         # can be partial. The complete FIFO capture below must retain every byte.
         run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"aevalsrc={stereo}:s=48000:d=1.137",
              "-c:a", "libopus", "-frame_duration", "60", "-y", longpacket])
+    if not (work / "smallpacket.mp4").exists():
+        # Minimum packet duration exercises all 32 preroll packets and pre-skip
+        # spanning multiple packets, unlike the usual 20-ms CELT fixtures.
+        run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"aevalsrc={stereo}:s=48000:d=1.137",
+             "-c:a", "libopus", "-frame_duration", "2.5", "-y", work / "smallpacket.mp4"])
+    for name, bitrate, extra in (("silk.mp4", "12k", []), ("hybrid.mp4", "24k", []),
+                                 ("silk-fec.mp4", "12k", ["-fec", "1", "-packet_loss", "25", "-frame_duration", "60"])):
+        if not (work / name).exists():
+            run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"aevalsrc={mono}:s=48000:d=6.137",
+                 "-c:a", "libopus", "-application", "voip", "-vbr", "off", "-b:a", bitrate,
+                 *extra, "-y", work / name])
+    # Nonuniform, monotonic packet timestamps. Payloads are unchanged. Two
+    # overlaps reproduce +1205 excess samples; a long gap tests held-frame state.
+    for name, sign, second in (("overlap.mp4", "-", 725), ("gap.mp4", "+", 12713)):
+        if not (work / name).exists():
+            expr = f"setts=ts=TS{sign}if(gte(N\\,20)\\,480\\,0){sign}if(gte(N\\,70)\\,{second}\\,0)"
+            run(["ffmpeg", "-v", "error", "-i", work / "stereo.mp4", "-c:a", "copy",
+                 "-bsf:a", expr, "-movie_timescale", "48000", "-y", work / name])
+    if not (work / "transitions.mp4").exists():
+        concat = work / "modes.txt"
+        concat.write_text("".join(f"file '{(work / name).resolve()}'\n"
+                                  for name in ("stereo.mp4", "silk.mp4", "hybrid.mp4")))
+        # Normalize timestamps, not payloads: each Opus packet is 960 samples.
+        # Independent encoders intentionally change mode/predictor at boundaries.
+        run(["ffmpeg", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat,
+             "-c:a", "copy", "-bsf:a", "setts=ts=N*960-312:duration=960",
+             "-movie_timescale", "48000", "-y", work / "transitions.mp4"])
     # Synthetic dOps output gain: +6.0195 dB (Q7.8). No clipping in this fixture.
     gained = bytearray((work / "stereo.mp4").read_bytes())
     at = gained.index(b"dOps")
@@ -76,12 +103,13 @@ def fixtures(work):
 def pcm_tests(args, media, evidence):
     results = []
     counts = {"mono.mp4": 12486576, "stereo.mp4": 294576, "surround.mp4": 54576,
-              "misnamed.bin": 294576, "gain.mp4": 294576, "lowdelay.mp4": 54576, "longpacket.mp4": 54576}
+              "misnamed.bin": 294576, "gain.mp4": 294576, "lowdelay.mp4": 54576,
+              "longpacket.mp4": 54576, "smallpacket.mp4": 54576}
     for name, total in counts.items():
         reference = evidence / "reference.pcm"
-        # Independent, installed FFmpeg native Opus decoder; trim to the known
+        # Independent, installed FFmpeg/libopus decoder; trim to the known
         # synthetic presentation length (MP4's last encoded packet is longer).
-        run(["ffmpeg", "-v", "error", "-c:a", "opus", "-i", media / name, "-ac", "2", "-ar", "48000",
+        run(["ffmpeg", "-v", "error", "-c:a", "libopus", "-i", media / name, "-ac", "2", "-ar", "48000",
              "-af", f"atrim=end_sample={total}", "-f", "s16le", "-y", reference])
         ref = np.fromfile(reference, dtype="<i2").reshape(-1, 2)
         assert len(ref) == total
@@ -96,6 +124,8 @@ def pcm_tests(args, media, evidence):
         targets = [0, 1, 311, 312, 3840, 48000, 48313, total - 1, total, total + 123]
         if name == "mono.mp4":
             targets += [251 * 48000, 259 * 48000 + 45120]
+        if name in ("lowdelay.mp4", "smallpacket.mp4"):
+            targets += [119, 120, 121]
         for target in targets:
             out = evidence / "decoded.pcm"
             command = args.runner + [args.pcm, str(media / name), str(target), str(out)]
@@ -106,7 +136,7 @@ def pcm_tests(args, media, evidence):
             delta = data.astype(float) - expected
             rmse = float(np.sqrt(np.mean(delta**2))) if len(data) else 0
             first_rmse = float(np.sqrt(np.mean(delta[:4800]**2))) if len(data) else 0
-            # 80-ms preroll restores predictor state, but need not be bit-identical
+            # Coded-packet preroll restores predictor state, but need not be bit-identical
             # to decode-from-start. A 1-sample shift fails by hundreds of counts.
             # Single-sample EOF cases test trimming/count, not statistical quality:
             # their recorded residual can be larger than a 100-ms RMS average.
@@ -124,6 +154,72 @@ def pcm_tests(args, media, evidence):
                                 first_100ms_rmse_s16=first_rmse, output=result))
         reference.unlink()
     (evidence / "decoded.pcm").unlink()
+    return results
+
+
+def timing_tests(args, media, evidence):
+    results = []
+    plain_path = evidence / "timing-reference.pcm"
+    run(["ffmpeg", "-v", "error", "-c:a", "libopus", "-i", media / "stereo.mp4", "-ac", "2",
+         "-f", "s16le", "-y", plain_path])
+    plain = np.fromfile(plain_path, dtype="<i2").reshape(-1, 2)[:294576]
+    for name in ("overlap.mp4", "gap.mp4", "silk.mp4", "hybrid.mp4", "silk-fec.mp4", "transitions.mp4"):
+        # TOC proves which modes were actually generated, rather than inferring
+        # them from encoder flags or filenames. No private media is used.
+        probe = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_packets",
+                                "-show_data", "-show_streams", "-of", "json", media / name]).stdout)
+        configs = {}
+        for packet in probe["packets"]:
+            config = int(packet["data"].split(":")[1].strip().split()[0][:2], 16) >> 3
+            configs[config] = configs.get(config, 0) + 1
+        if name.startswith("silk"):
+            assert all(c < 12 for c in configs), configs
+        if name == "hybrid.mp4":
+            assert all(12 <= c < 16 for c in configs), configs
+        if name == "transitions.mp4":
+            assert any(c < 12 for c in configs) and any(12 <= c < 16 for c in configs) and any(c >= 16 for c in configs)
+        total = int(probe["streams"][0]["duration_ts"])
+        assert probe["streams"][0]["time_base"] == "1/48000"
+        if name == "overlap.mp4":
+            # First-presented PCM wins. Remove the start of packets 20/70,
+            # not the end of the previous packet or an arbitrary final tail.
+            expected = np.concatenate((plain[:18888], plain[19368:66888], plain[67613:]))
+            assert total == 294576 - 1205
+        elif name == "gap.mp4":
+            expected = np.concatenate((plain[:18888], np.zeros((480, 2), dtype="<i2"),
+                                       plain[18888:66888], np.zeros((12713, 2), dtype="<i2"), plain[66888:]))
+            assert total == 294576 + 13193
+        else:
+            run(["ffmpeg", "-v", "error", "-c:a", "libopus", "-i", media / name, "-ac", "2",
+                 "-f", "s16le", "-y", plain_path])
+            expected = np.fromfile(plain_path, dtype="<i2").reshape(-1, 2)[:total]
+            if name != "transitions.mp4":
+                assert total == 294576
+            else:
+                # Three 308-packet sections, 960 samples each, 312 pre-skip.
+                assert total == 886728
+        assert len(expected) == total
+        targets = [0, 18887, 18889, 19128, 48000, 66407, 67001, 73013, total - 1, total, total + 123]
+        if name == "transitions.mp4":
+            targets += [308 * 960 + 731, 616 * 960 + 827, 700000]
+        for target in targets:
+            out = evidence / "timing-decoded.pcm"
+            log = run(args.runner + [args.pcm, str(media / name), str(target), str(out)]).stdout.decode().strip()
+            data = np.fromfile(out, dtype="<i2").reshape(-1, 2)
+            assert len(data) == max(0, total - target), (name, target, len(data), total)
+            delta = data.astype(float) - expected[target:]
+            rmse = float(np.sqrt(np.mean(delta**2))) if len(data) else 0
+            first = float(np.sqrt(np.mean(delta[:4800]**2))) if len(data) else 0
+            # Full decode must agree tightly. Seeks warm up predictors, not
+            # restore arbitrary encoder history bit-for-bit (especially SILK).
+            if target == 0:
+                assert rmse < 1, (name, rmse)
+            elif len(data) >= 4800:
+                assert rmse < 150, (name, target, rmse)
+            results.append(dict(media=name, toc_configs=configs, target_sample=target,
+                                frames=len(data), rmse_s16=rmse, first_100ms_rmse_s16=first, output=log))
+        out.unlink()
+    plain_path.unlink()
     return results
 
 
@@ -315,10 +411,12 @@ def main():
     run(args.runner + [args.aac_probe, str(media / "aac-mono.mp4")])
     report = dict(execution="QEMU ARM emulation" if args.runner else "native x86_64 desktop",
                   unchanged_rejection=text, pcm=pcm_tests(args, media, evidence),
+                  timing=timing_tests(args, media, evidence),
                   legacy_controls=controls(args, media, evidence))
     for name, seek, frames in (("mono.mp4", None, 12486576), ("mono.mp4", 251, 438576),
                                ("mono.mp4", 260, 6576), ("misnamed.bin", None, 294576),
-                               ("metadata.m4b", None, 294576), ("longpacket.mp4", None, 54576)):
+                               ("metadata.m4b", None, 294576), ("longpacket.mp4", None, 54576),
+                               ("overlap.mp4", None, 293371), ("gap.mp4", None, 307769)):
         out = capture(args.runner + [args.player], evidence / f"opus-{name}-{seek}", media / name, seek)
         assert out.stat().st_size == frames * 4, (name, seek, out.stat().st_size)
         if name == "longpacket.mp4":
@@ -337,7 +435,8 @@ def main():
     assert after_fds[-1] - after_fds[0] == before_fds[-1] - before_fds[0]
     (evidence / "results.json").write_text(json.dumps(report, indent=2))
     print(f"PASS: {len(report['pcm'])} sample/seek cases, {len(report['legacy_controls'])} byte-identical legacy controls,")
-    print("      6 FIFO/EOF captures, tags/cover, Opus and before/after AAC pause/resume/stop/cleanup.")
+    print(f"      {len(report['timing'])} overlap/gap/SILK/hybrid/mode-transition cases,")
+    print("      8 FIFO/EOF captures, tags/cover, Opus and before/after AAC pause/resume/stop/cleanup.")
     print("Known upstream status-position regression:", report["baseline_aac_interaction"]["position_regressed"])
     print("Known upstream AAC FD growth (before/after):", before_fds, after_fds)
     print("Results:", evidence / "results.json")

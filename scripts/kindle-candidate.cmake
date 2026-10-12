@@ -17,6 +17,6 @@ set(CMAKE_CXX_FLAGS_INIT "-isystem ${KINAMP_TARGET_SYSROOT}/usr/include -march=a
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-L${KINAMP_TARGET_SYSROOT}/usr/lib -Wl,-rpath-link,${KINAMP_TARGET_SYSROOT}/usr/lib -Wl,-rpath-link,${KINAMP_TARGET_SYSROOT}/lib")
 set(CMAKE_SKIP_RPATH TRUE)
 set(ENV{PKG_CONFIG_PATH} "")
-set(ENV{PKG_CONFIG_LIBDIR} "${KINAMP_FFMPEG_PREFIX}/lib/pkgconfig:${KINAMP_TARGET_SYSROOT}/usr/lib/pkgconfig")
+set(ENV{PKG_CONFIG_LIBDIR} "${KINAMP_FFMPEG_PREFIX}/lib/pkgconfig:${KINAMP_FFMPEG_PREFIX}/opus/lib/pkgconfig:${KINAMP_TARGET_SYSROOT}/usr/lib/pkgconfig")
 # Both PC sets were generated with absolute staging prefixes.
 set(ENV{PKG_CONFIG_SYSROOT_DIR} "")
