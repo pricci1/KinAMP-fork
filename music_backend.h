@@ -1,3 +1,4 @@
+// Modified 2026-10-12: isolated Opus-in-MP4 prototype; GPL-3.0-or-later.
 #ifndef MUSIC_BACKEND_H
 #define MUSIC_BACKEND_H
 
@@ -27,6 +28,7 @@ struct Chapter {
 
 enum class AudioFormat {
     UNKNOWN,
+    OPUS_MP4,   // Content-probed ISO MP4 (restricted FFmpeg)
     M4B_AAC,    // M4A/M4B MP4 Container (FAAD + mp4read)
     MINIAUDIO,  // MP3, FLAC, WAV, OGG/Vorbis (miniaudio)
     AAC_ADTS    // Raw AAC stream (FAAD) - Future support
@@ -95,6 +97,7 @@ private:
     void decode_loop();
 
     // Decoding Strategies
+    void decode_opus_mp4(const char* filepath, int start_time);
     void decode_mp4_file(const char* filepath, int start_time);
     void decode_miniaudio(const char* filepath, int start_time); // For files
     void decode_stream(const char* url); // HTTP streams: open, sniff, dispatch

@@ -1,3 +1,4 @@
+# Modified 2026-10-12: opt-in isolated Opus-in-MP4 prototype; GPL-3.0-or-later.
 cmake_minimum_required(VERSION 3.5)
 
 # Keep in sync with the GIT release tag: the "Check for updates" dialog compares
@@ -14,6 +15,12 @@ find_package(PkgConfig REQUIRED)
 # built. Only KinAMP-minimal is wanted there, and it is what the KOReader
 # plugin drives anyway.
 option(KINAMP_KOBO "Build the Kobo flavour: KinAMP-minimal only" OFF)
+option(KINAMP_MINIMAL_ONLY "Skip GUI dependency discovery" OFF)
+option(KINAMP_OPUS_MP4 "Decode Opus in ISO MP4 using restricted FFmpeg" OFF)
+
+if(KINAMP_OPUS_MP4)
+    pkg_check_modules(FFMPEG REQUIRED libavformat>=61 libavcodec>=61 libavutil libswresample)
+endif()
 
 # KinAMP-minimal needs glib (main loop, the command FIFO watch) but no toolkit.
 # It used to reach glib through gtk+-2.0's include path, which is why it linked
@@ -22,7 +29,7 @@ pkg_check_modules(GLIB IMPORTED_TARGET REQUIRED glib-2.0 gobject-2.0)
 
 # The GUI player's dependencies. Kindle-only, so not looked for elsewhere:
 # a missing gtk+-2.0 must not fail a Kobo configure.
-if(NOT KINAMP_KOBO)
+if(NOT KINAMP_KOBO AND NOT KINAMP_MINIMAL_ONLY)
     pkg_check_modules(GTK IMPORTED_TARGET REQUIRED gtk+-2.0)
     pkg_check_modules(XML IMPORTED_TARGET REQUIRED libxml-2.0)
 endif()
@@ -93,7 +100,7 @@ set(MPEG4_SOURCES
     mpeg4/unicode_support.c
 )
 
-if(LIPC_LIBRARY)
+if(LIPC_LIBRARY AND NOT KINAMP_MINIMAL_ONLY)
     add_executable(${PROJECT_NAME}
         music_player.cpp
         music_backend.cpp
@@ -175,6 +182,18 @@ else()
 endif()
 
 kinamp_check_abi(KinAMP-minimal)
+
+if(KINAMP_OPUS_MP4)
+    foreach(target KinAMP KinAMP-minimal)
+        if(TARGET ${target})
+            target_sources(${target} PRIVATE opus_mp4.cpp)
+            target_compile_definitions(${target} PRIVATE KINAMP_OPUS_MP4=1)
+            target_include_directories(${target} PRIVATE ${FFMPEG_INCLUDE_DIRS})
+            # The restricted build is static: include its private dependencies.
+            target_link_libraries(${target} PRIVATE ${FFMPEG_STATIC_LDFLAGS})
+        endif()
+    endforeach()
+endif()
 
 add_executable(radio_cli radio_cli.cpp station_db.cpp)
 target_compile_options(radio_cli PRIVATE -Wall -Wextra)

@@ -1,7 +1,12 @@
+// Modified 2026-10-12: isolated Opus-in-MP4 prototype; GPL-3.0-or-later.
 #include "music_backend.h"
 #include "tags.h"
 #include "icy_client.h"
 #include "adts.h"
+#ifdef KINAMP_OPUS_MP4
+#include "opus_mp4.h"
+#include <poll.h>
+#endif
 #include <glib.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -101,6 +106,10 @@ static AudioFormat detect_format_helper(const char* resource, InputType type) {
         return AudioFormat::UNKNOWN; 
     }
 
+#ifdef KINAMP_OPUS_MP4
+    OpusMp4 opus;
+    if (opus.open(resource)) return AudioFormat::OPUS_MP4;
+#endif
     std::string ext = get_extension(resource);
     if (ext == ".m4b" || ext == ".m4a" || ext == ".mp4") {
         return AudioFormat::M4B_AAC;
@@ -405,7 +414,7 @@ void Decoder::set_volume(double vol) {
 }
 
 bool Decoder::start(const char* filepath, int start_time) {
-    if (running) {
+    if (thread_id != 0) {
         stop();
     }
 
@@ -417,6 +426,7 @@ bool Decoder::start(const char* filepath, int start_time) {
 
     if (pthread_create(&thread_id, NULL, thread_func, this) != 0) {
         perror("Decoder: Failed to create thread");
+        thread_id = 0;
         running = false;
         return false;
     }
@@ -465,7 +475,7 @@ void Decoder::emit_metadata(const std::string& raw_title) {
 }
 
 void Decoder::stop() {
-    if (!running) return;
+    if (thread_id == 0) return;
 
     stop_flag = true;
 
@@ -512,6 +522,10 @@ void Decoder::decode_loop() {
 
     if (inputType == InputType::STREAM) {
         decode_stream(current_filepath.c_str());
+#ifdef KINAMP_OPUS_MP4
+    } else if (format == AudioFormat::OPUS_MP4) {
+        decode_opus_mp4(current_filepath.c_str(), start_time);
+#endif
     } else if (format == AudioFormat::M4B_AAC) {
         decode_mp4_file(current_filepath.c_str(), start_time);
     } else if (format == AudioFormat::MINIAUDIO) {
@@ -521,6 +535,69 @@ void Decoder::decode_loop() {
         running = false;
     }
 }
+
+#ifdef KINAMP_OPUS_MP4
+void Decoder::decode_opus_mp4(const char* filepath, int start_time) {
+    OpusMp4 opus;
+    int result = 0;
+    if (!opus.open(filepath) || (result = opus.seek((int64_t)start_time * 48000)) < 0) {
+        g_printerr("Decoder: Failed to open/seek Opus MP4: %s (%d)\n", filepath, result);
+        if (on_error_callback) on_error_callback("Unable to decode Opus MP4.", error_user_data);
+        running = false;
+        return;
+    }
+    g_print("Decoder: Opus MP4 Init 48000 Hz, stereo PCM; seek %d\n", start_time);
+    // Nonblocking open/write and bounded poll let stop interrupt a full FIFO,
+    // including while the GStreamer pipeline is paused or being torn down.
+    int fd = -1;
+    while (!stop_flag && fd < 0) {
+        fd = open(PIPE_PATH, O_WRONLY | O_NONBLOCK);
+        if (fd < 0 && errno != ENXIO && errno != EINTR) break;
+        if (fd < 0) usleep(10000);
+    }
+    if (fd < 0) {
+        if (!stop_flag && on_error_callback) on_error_callback("Unable to open PCM FIFO.", error_user_data);
+        running = false;
+        return;
+    }
+    std::vector<int16_t> pcm;
+    while (!stop_flag && (result = opus.read(pcm)) > 0) {
+        double vol = volume.load();
+        if (vol != 1.0) {
+            for (auto& sample : pcm) sample = (int16_t)(sample * vol);
+        }
+        const char* bytes = reinterpret_cast<const char*>(pcm.data());
+        size_t remaining = pcm.size() * sizeof(int16_t);
+        while (!stop_flag && remaining > 0) {
+            struct pollfd pfd = {fd, POLLOUT, 0};
+            int ready = poll(&pfd, 1, 50);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                result = AVERROR(EPIPE);
+                break;
+            }
+            if (!ready) continue;
+            ssize_t written = write(fd, bytes, remaining);
+            if (written < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            if (written <= 0) {
+                result = AVERROR(errno);
+                break;
+            }
+            bytes += written;
+            remaining -= written;
+        }
+        if (result < 0) break;
+    }
+    close(fd);
+    // The backend closes the reader before joining us on stop/seek. EPIPE is
+    // therefore a normal output teardown, not a codec error to report to GUI.
+    if (result < 0 && result != AVERROR(EPIPE) && !stop_flag && on_error_callback) {
+        on_error_callback("Opus MP4 decode/output failed.", error_user_data);
+    }
+    running = false;
+    g_print("Decoder: Opus MP4 Thread exiting (%d).\n", result);
+}
+#endif
 
 void Decoder::decode_mp4_file(const char* filepath, int start_time) {
     std::lock_guard<std::mutex> lock(mp4_mutex);
@@ -1174,6 +1251,36 @@ void MusicBackend::read_metadata(const char* filepath) {
         return; 
     }
 
+#ifdef KINAMP_OPUS_MP4
+    if (format == AudioFormat::OPUS_MP4) {
+        OpusMp4 opus;
+        if (!opus.open(filepath)) return;
+        current_samplerate = 48000;
+        total_duration = opus.duration_samples() * GST_SECOND / 48000;
+        AVFormatContext* fmt = opus.format();
+        const char* keys[] = {"title", "artist", "album"};
+        std::string* values[] = {&meta_title, &meta_artist, &meta_album};
+        for (int i = 0; i < 3; ++i) {
+            AVDictionaryEntry* tag = av_dict_get(fmt->metadata, keys[i], nullptr, 0);
+            if (tag) *values[i] = tag->value;
+        }
+        for (unsigned i = 0; i < fmt->nb_chapters; ++i) {
+            AVChapter* chapter = fmt->chapters[i];
+            Chapter ch;
+            ch.timestamp = av_rescale_q(chapter->start, chapter->time_base, AVRational{1, 10000000});
+            AVDictionaryEntry* title = av_dict_get(chapter->metadata, "title", nullptr, 0);
+            ch.title = title ? title->value : "";
+            chapters.push_back(ch);
+        }
+        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+            if (fmt->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) {
+                AVPacket& pic = fmt->streams[i]->attached_pic;
+                if (pic.size > 0) cover_art.assign(pic.data, pic.data + pic.size);
+                break;
+            }
+        }
+    } else
+#endif
     if (format == AudioFormat::M4B_AAC) {
         std::lock_guard<std::mutex> lock(mp4_mutex);
         mp4config.verbose.tags = 1;
