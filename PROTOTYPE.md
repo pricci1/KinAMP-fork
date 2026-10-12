@@ -4,6 +4,12 @@ This is review/build material, **not a Kindle installation package**. Nothing
 was pushed, published, deployed, or installed on a Kindle/runner. KoReadalong
 code and books were not changed. All media in this experiment is synthetic.
 
+**Target-linked continuation:** [KINDLE_CANDIDATE.md](KINDLE_CANDIDATE.md) records
+the supplied Paperwhite 6 library inventory, corrected GLIBC/GLIBCXX premise,
+new target-linked build/preflight, and owner-only native acceptance procedure.
+The Debian/QEMU measurements below remain historical evidence, not deployment
+artifacts or a claim that this device lacks GLIBC_2.35 / GLIBCXX_3.4.29.
+
 ## Provenance and design
 
 - KinAMP source: [main 91b661c](https://github.com/kbarni/KinAMP/commit/91b661cd9ffdd022e9af698b071256426c81351b).
