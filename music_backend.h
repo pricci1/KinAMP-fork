@@ -10,6 +10,9 @@
 #include <memory>
 #include <mutex>
 #include <sys/types.h>
+#ifdef KINAMP_SPEED
+#include "pcm_tempo.h"
+#endif
 
 // Callback type for End of Stream (song finished)
 typedef void (*EosCallback)(void* user_data);
@@ -73,6 +76,9 @@ public:
     void emit_metadata(const std::string& raw_title);
 
     void set_volume(double vol);
+#ifdef KINAMP_SPEED
+    PcmTempo tempo;
+#endif
 
 private:
     std::atomic<bool> stop_flag;
@@ -120,11 +126,16 @@ public:
     ~MusicBackend();
 
     // --- Public API ---
-    void play_file(const char* filepath, int start_time = 0);
+    void play_file(const char* filepath, int start_time = 0, bool start_paused = false);
     void pause();
     void stop();
     void set_volume(double volume);
     double get_volume();
+#ifdef KINAMP_SPEED
+    bool set_speed(double speed);
+    double get_speed() const;
+    bool speed_supported() const;
+#endif
     
     // Returns true if the backend is currently performing a stop operation
     // (used to prevent UI race conditions)
@@ -169,6 +180,12 @@ private:
 
     gint64 last_position;
     double current_volume;
+#ifdef KINAMP_SPEED
+    bool tempo_active = false;
+    int current_channels = 2;
+    std::atomic<gint64> presented_output_ns{0};
+    static void tempo_handoff(GstElement*, GstBuffer*, gpointer);
+#endif
 
     // Helper to cleanup GStreamer resources
     void cleanup_pipeline();

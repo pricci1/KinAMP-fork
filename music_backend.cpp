@@ -397,7 +397,11 @@ static ma_result StreamVFS_onInfo(ma_vfs* pVFS, ma_vfs_file file, ma_file_info* 
 // Decoder Implementation
 // =================================================================================
 
-Decoder::Decoder() : stop_flag(false), running(false), thread_id(0), volume(1.0), on_error_callback(NULL), error_user_data(NULL), on_metadata_callback(NULL), metadata_user_data(NULL), last_stream_title(""), current_stream_pid(0), current_stream_fd(-1) {
+Decoder::Decoder() :
+#ifdef KINAMP_SPEED
+    tempo(stop_flag),
+#endif
+    stop_flag(false), running(false), thread_id(0), volume(1.0), on_error_callback(NULL), error_user_data(NULL), on_metadata_callback(NULL), metadata_user_data(NULL), last_stream_title(""), current_stream_pid(0), current_stream_fd(-1) {
     unlink(PIPE_PATH);
     if (mkfifo(PIPE_PATH, 0666) == -1) {
         perror("Decoder: Failed to create named pipe");
@@ -423,6 +427,9 @@ bool Decoder::start(const char* filepath, int start_time) {
     stop_flag = false;
     running = true;
     last_stream_title.clear();
+#ifdef KINAMP_SPEED
+    tempo.reset((int64_t)start_time * GST_SECOND);
+#endif
 
     if (pthread_create(&thread_id, NULL, thread_func, this) != 0) {
         perror("Decoder: Failed to create thread");
@@ -547,6 +554,13 @@ void Decoder::decode_opus_mp4(const char* filepath, int start_time) {
         return;
     }
     g_print("Decoder: Opus MP4 Init 48000 Hz, stereo PCM; seek %d\n", start_time);
+#ifdef KINAMP_SPEED
+    if (!tempo.open(PIPE_PATH, 48000, 2)) {
+        if (!stop_flag && on_error_callback) on_error_callback("Unable to open PCM output.", error_user_data);
+        running = false;
+        return;
+    }
+#else
     // Nonblocking open/write and bounded poll let stop interrupt a full FIFO,
     // including while the GStreamer pipeline is paused or being torn down.
     int fd = -1;
@@ -560,12 +574,19 @@ void Decoder::decode_opus_mp4(const char* filepath, int start_time) {
         running = false;
         return;
     }
+#endif
     std::vector<int16_t> pcm;
     while (!stop_flag && (result = opus.read(pcm)) > 0) {
         double vol = volume.load();
         if (vol != 1.0) {
             for (auto& sample : pcm) sample = (int16_t)(sample * vol);
         }
+#ifdef KINAMP_SPEED
+        if (!tempo.write(pcm.data(), pcm.size() / 2)) {
+            result = AVERROR(EPIPE);
+            break;
+        }
+#else
         const char* bytes = reinterpret_cast<const char*>(pcm.data());
         size_t remaining = pcm.size() * sizeof(int16_t);
         while (!stop_flag && remaining > 0) {
@@ -587,8 +608,13 @@ void Decoder::decode_opus_mp4(const char* filepath, int start_time) {
             remaining -= written;
         }
         if (result < 0) break;
+#endif
     }
+#ifdef KINAMP_SPEED
+    if (!tempo.finish() && result >= 0) result = AVERROR(EPIPE);
+#else
     close(fd);
+#endif
     // The backend closes the reader before joining us on stop/seek. EPIPE is
     // therefore a normal output teardown, not a codec error to report to GUI.
     if (result < 0 && result != AVERROR(EPIPE) && !stop_flag && on_error_callback) {
@@ -629,6 +655,9 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
     }
     g_print("Decoder: M4B Init %lu Hz, %d channels\n", samplerate, channels);
 
+#ifdef KINAMP_SPEED
+    bool seek_eof = false;
+#endif
     if (start_time > 0) {
         unsigned long samples_per_frame = 1024;
         if (mp4config.frame.nsamples > 0 && mp4config.samples > 0) {
@@ -643,6 +672,10 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
              } else {
                  g_printerr("Decoder: Failed to seek to frame %lu\n", target_frame);
              }
+#ifdef KINAMP_SPEED
+        } else {
+             seek_eof = true; // do not replay from zero for an out-of-range seek
+#endif
         }
     } else {
         mp4read_seek(0);
@@ -654,6 +687,15 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
         return;
     }
 
+#ifdef KINAMP_SPEED
+    if ((channels != 1 && channels != 2) || !tempo.open(PIPE_PATH, samplerate, channels)) {
+        if (!stop_flag && on_error_callback) on_error_callback("Unable to open AAC PCM output.", error_user_data);
+        NeAACDecClose(hDecoder);
+        mp4read_close();
+        running = false;
+        return;
+    }
+#else
     int fd = open(PIPE_PATH, O_WRONLY);
     if (fd == -1) {
         perror("Decoder: Failed to open pipe");
@@ -661,15 +703,24 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
         mp4read_close();
         return;
     }
+#endif
 
     if (stop_flag) {
+#ifdef KINAMP_SPEED
+        tempo.finish();
+#else
         close(fd);
+#endif
         NeAACDecClose(hDecoder);
         mp4read_close();
         return;
     }
 
-    while (!stop_flag) {
+    while (!stop_flag
+#ifdef KINAMP_SPEED
+           && !seek_eof
+#endif
+    ) {
         if (mp4read_frame() != 0) {
             break;
         }
@@ -692,6 +743,9 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
                     samples[i] = (int16_t)(samples[i] * vol);
                 }
             }
+#ifdef KINAMP_SPEED
+            if (!tempo.write(samples, frameInfo.samples / channels)) break;
+#else
             ssize_t to_write = frameInfo.samples * 2; 
             ssize_t written = write(fd, samples, to_write);
 
@@ -702,10 +756,16 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
                 perror("Decoder: write error");
                 break;
             }
+#endif
         }
     }
 
+#ifdef KINAMP_SPEED
+    tempo.finish();
+    running = false;
+#else
     close(fd);
+#endif
     NeAACDecClose(hDecoder);
     mp4read_close();
     g_print("Decoder: M4B Thread exiting.\n");
@@ -1218,6 +1278,24 @@ gint64 MusicBackend::get_position() {
         return last_position;
     }
 
+#ifdef KINAMP_SPEED
+    if (tempo_active && pipeline && is_playing) {
+        GstClock* clock = gst_element_get_clock(pipeline);
+        if (clock) {
+            GstClockTime now = gst_clock_get_time(clock);
+            GstClockTime base = gst_element_get_base_time(pipeline);
+            gst_object_unref(clock);
+            gint64 output_time = GST_CLOCK_TIME_IS_VALID(base) && now > base ? now - base : 0;
+            // A stalled sink/source must not report the decoder's queued PCM
+            // as already played. The sink-side handoff bounds this clock estimate.
+            output_time = std::min(output_time, presented_output_ns.load());
+            gint64 media = decoder->tempo.position(output_time);
+            if (total_duration > 0) media = std::min(media, total_duration);
+            last_position = std::max(last_position, media);
+        }
+        return last_position;
+    }
+#endif
     if (pipeline && is_playing) {
         GstClock *clock = gst_element_get_clock(pipeline);
         if (clock) {
@@ -1241,6 +1319,9 @@ void MusicBackend::read_metadata(const char* filepath) {
     chapters.clear();
     current_samplerate = 44100; 
     total_duration = 0;
+#ifdef KINAMP_SPEED
+    current_channels = 2;
+#endif
 
     if (filepath == nullptr) return;
 
@@ -1306,6 +1387,9 @@ void MusicBackend::read_metadata(const char* filepath) {
             if (hDecoder) {
                  NeAACDecConfigurationPtr config = NeAACDecGetCurrentConfiguration(hDecoder);
                  config->outputFormat = FAAD_FMT_16BIT;
+#ifdef KINAMP_SPEED
+                 config->downMatrix = 1; // match the PCM decoder's channel count
+#endif
                  NeAACDecSetConfiguration(hDecoder, config);
 
                  unsigned long rate = 0;
@@ -1314,6 +1398,9 @@ void MusicBackend::read_metadata(const char* filepath) {
                      if (rate > 0) {
                          current_samplerate = (int)rate;
                      }
+#ifdef KINAMP_SPEED
+                     current_channels = channels;
+#endif
                  }
                  NeAACDecClose(hDecoder);
             }
@@ -1355,7 +1442,7 @@ void MusicBackend::read_metadata(const char* filepath) {
     }
 }
 
-void MusicBackend::play_file(const char* filepath, int start_time) {
+void MusicBackend::play_file(const char* filepath, int start_time, bool start_paused) {
     if (stopping) return;
 
     if (is_playing || is_paused) {
@@ -1374,12 +1461,40 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
 
     g_print("Backend: Playing %s from %d\n", filepath, start_time);
     is_playing = true;
-    is_paused = false;
+    is_paused = start_paused;
     last_position = start_time * GST_SECOND;
+#ifdef KINAMP_SPEED
+    presented_output_ns = 0;
+    if (total_duration > 0) last_position = std::min(last_position, total_duration);
+#endif
 
     int rate = (current_samplerate > 0) ? current_samplerate : 44100;
 
     GError *pipeline_error = NULL;
+#ifdef KINAMP_SPEED
+    AudioFormat format = detect_format_helper(filepath, type);
+    tempo_active = type == InputType::FILE &&
+        (format == AudioFormat::M4B_AAC || format == AudioFormat::OPUS_MP4);
+    // Timestamp the bytes, not the decoder's read-ahead. Map the running clock
+    // through output epochs, bounded by the last buffer released to the sink.
+    std::string pcm_stage;
+    if (tempo_active) {
+        pcm_stage = "identity datarate=" + std::to_string(rate * current_channels * 2) +
+            " ! queue max-size-bytes=" + std::to_string(rate * current_channels * 2 / 10) +
+            " max-size-time=0 max-size-buffers=0 ! identity name=tempo_clock signal-handoffs=true ! ";
+    } else {
+        pcm_stage = "queue ! ";
+    }
+#ifdef GST10
+    gchar *pipeline_desc = g_strdup_printf(
+        "filesrc location=\"%s\" ! audio/x-raw, format=S16LE, layout=interleaved, rate=%d, channels=%d ! %s%s",
+        PIPE_PATH, rate, tempo_active ? current_channels : 2, pcm_stage.c_str(), audio_sink());
+#else
+    gchar *pipeline_desc = g_strdup_printf(
+        "filesrc location=\"%s\" ! audio/x-raw-int, endianness=1234, signed=true, width=16, depth=16, rate=%d, channels=%d ! %s%s",
+        PIPE_PATH, rate, tempo_active ? current_channels : 2, pcm_stage.c_str(), audio_sink());
+#endif
+#else
 #ifdef GST10
     gchar *pipeline_desc = g_strdup_printf(
         "filesrc location=\"%s\" ! audio/x-raw, format=S16LE, layout=interleaved, rate=%d, channels=2 ! queue ! %s",
@@ -1390,6 +1505,7 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
         "filesrc location=\"%s\" ! audio/x-raw-int, endianness=1234, signed=true, width=16, depth=16, rate=%d, channels=2 ! queue ! %s",
         PIPE_PATH, rate, audio_sink()
     );
+#endif
 #endif
     pipeline = gst_parse_launch(pipeline_desc, &pipeline_error);
 
@@ -1405,6 +1521,13 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
     if (pipeline_error) g_error_free(pipeline_error);
     g_free(pipeline_desc);
 
+#ifdef KINAMP_SPEED
+    if (tempo_active) {
+        GstElement* observer = gst_bin_get_by_name(GST_BIN(pipeline), "tempo_clock");
+        g_signal_connect(observer, "handoff", G_CALLBACK(tempo_handoff), this);
+        gst_object_unref(observer);
+    }
+#endif
     bus = gst_element_get_bus(pipeline);
     bus_watch_id = gst_bus_add_watch(bus, bus_callback_func, this);
     gst_object_unref(bus);
@@ -1414,12 +1537,20 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
         return;
     }
 
-    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    gst_element_set_state(pipeline, start_paused ? GST_STATE_PAUSED : GST_STATE_PLAYING);
 }
 
 void MusicBackend::pause() {
     if (!pipeline || !is_playing) return;
 
+#ifdef KINAMP_SPEED
+    if (tempo_active) {
+        if (!is_paused) last_position = get_position();
+        gst_element_set_state(pipeline, is_paused ? GST_STATE_PLAYING : GST_STATE_PAUSED);
+        is_paused = !is_paused;
+        return;
+    }
+#endif
     if (is_paused) {
         GstClock *clock = gst_element_get_clock(pipeline);
         if (clock) {
@@ -1446,6 +1577,9 @@ void MusicBackend::stop() {
     if (stopping) return;
     stopping = true;
 
+#ifdef KINAMP_SPEED
+    if (tempo_active) last_position = get_position();
+#endif
     if (pipeline) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
     }
@@ -1468,6 +1602,29 @@ double MusicBackend::get_volume() {
     return current_volume;
 }
 
+#ifdef KINAMP_SPEED
+bool MusicBackend::set_speed(double speed) {
+    // Ordered bounds also reject NaN/infinities, without the target C math
+    // header's isfinite macro colliding with a C++ namespace-qualified call.
+    if (!(speed >= 0.5 && speed <= 3.0)) return false;
+    decoder->tempo.speed = speed;
+    return true;
+}
+
+double MusicBackend::get_speed() const { return decoder->tempo.speed.load(); }
+
+bool MusicBackend::speed_supported() const { return tempo_active; }
+
+void MusicBackend::tempo_handoff(GstElement*, GstBuffer* buffer, gpointer data) {
+    MusicBackend* self = static_cast<MusicBackend*>(data);
+    GstClockTime stamp = GST_BUFFER_TIMESTAMP(buffer);
+    GstClockTime duration = GST_BUFFER_DURATION(buffer);
+    if (GST_CLOCK_TIME_IS_VALID(stamp) && GST_CLOCK_TIME_IS_VALID(duration)) {
+        self->presented_output_ns = stamp + duration;
+    }
+}
+#endif
+
 void MusicBackend::cleanup_pipeline() {
     if (bus_watch_id > 0) {
         g_source_remove(bus_watch_id);
@@ -1487,6 +1644,14 @@ gboolean MusicBackend::bus_callback_func(GstBus *bus, GstMessage *msg, gpointer 
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_EOS:
             g_print("Backend: EOS reached.\n");
+#ifdef KINAMP_SPEED
+            if (self->tempo_active) {
+                // EOS acknowledges all submitted output; use the exact epoch
+                // endpoint rather than flooring byte timestamps by a sample.
+                self->last_position = self->decoder->tempo.position(G_MAXINT64);
+                if (self->total_duration > 0) self->last_position = std::min(self->last_position, self->total_duration);
+            }
+#endif
             self->stop(); 
 
             if (self->on_eos_callback) {

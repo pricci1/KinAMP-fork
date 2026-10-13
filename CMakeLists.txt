@@ -17,6 +17,7 @@ find_package(PkgConfig REQUIRED)
 option(KINAMP_KOBO "Build the Kobo flavour: KinAMP-minimal only" OFF)
 option(KINAMP_MINIMAL_ONLY "Skip GUI dependency discovery" OFF)
 option(KINAMP_OPUS_MP4 "Decode Opus in ISO MP4 using restricted FFmpeg" OFF)
+option(KINAMP_SPEED "Prototype pitch-preserving local AAC/Opus speed" OFF)
 
 if(KINAMP_OPUS_MP4)
     pkg_check_modules(FFMPEG REQUIRED libavformat>=61 libavcodec>=61 libavutil libswresample)
@@ -182,6 +183,15 @@ else()
 endif()
 
 kinamp_check_abi(KinAMP-minimal)
+
+if(KINAMP_SPEED)
+    foreach(target KinAMP KinAMP-minimal)
+        if(TARGET ${target})
+            target_sources(${target} PRIVATE pcm_tempo.cpp third_party/sonic/sonic.c)
+            target_compile_definitions(${target} PRIVATE KINAMP_SPEED=1)
+        endif()
+    endforeach()
+endif()
 
 if(KINAMP_OPUS_MP4)
     foreach(target KinAMP KinAMP-minimal)

@@ -3,6 +3,7 @@
 # Usage: build-kindle-candidate.sh PRIVATE_TARGET_ROOT OUTPUT_ROOT
 # Requires Debian gcc/g++-arm-linux-gnueabihf 12, cmake, pkg-config, curl,
 # make, xz, bzip2, gettext, qemu-user, glib-mkenums. No vendor libs distributed.
+# KINAMP_SPEED=ON opts into the local speed prototype; default stays OFF.
 set -eu
 target=$(realpath "$1")
 out=$(realpath -m "$2")
@@ -112,6 +113,7 @@ cmake --fresh -S "$source" -B "$out/player" \
     -DKINAMP_TARGET_SYSROOT="$sysroot" -DKINAMP_FFMPEG_PREFIX="$out/ffmpeg" \
     -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS -Wl,-Map,$out/player.link.map" \
     -DGST10=OFF -DKINAMP_MINIMAL_ONLY=ON -DKINAMP_OPUS_MP4=ON \
+    -DKINAMP_SPEED="${KINAMP_SPEED:-OFF}" \
     -DKINAMP_CHECK_ABI=OFF -DCMAKE_BUILD_TYPE=MinSizeRel > "$out/cmake.log" 2>&1
 cmake --build "$out/player" --target KinAMP-minimal -j"${JOBS:-4}" > "$out/player-build.log" 2>&1
 cp "$out/player/KinAMP-minimal" "$out/KinAMP-minimal.pw6-gst010"

@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <cmath>
 
 #include "music_backend.h"
 
@@ -399,6 +400,17 @@ static void write_status(CliState* state) {
     out << "pos=" << (long long)(state->backend->get_position() / GST_SECOND) << "\n";
     out << "dur=" << (long long)(state->backend->get_duration() / GST_SECOND) << "\n";
     out << "vol=" << (int)(state->backend->get_volume() * 100.0 + 0.5) << "\n";
+#ifdef KINAMP_SPEED
+    out << "capabilities=speed-v1\n";
+    out << "speed_min=0.5\nspeed_max=3\nspeed_formats=aac-mp4";
+#ifdef KINAMP_OPUS_MP4
+    out << ",opus-mp4";
+#endif
+    out << "\n";
+    out << "speed=" << state->backend->get_speed() << "\n";
+    out << "speed_supported=" << state->backend->speed_supported() << "\n";
+    out << "pos_ms=" << state->backend->get_position() / GST_MSECOND << "\n";
+#endif
     out.close();
 
     rename(tmp_path.c_str(), path.c_str());
@@ -609,10 +621,28 @@ void handle_command(CliState* state, const std::string& raw) {
             state->current_index < (int)state->playlist.size()) {
             int seconds = atoi(arg.c_str());
             if (seconds < 0) seconds = 0;
+#ifdef KINAMP_SPEED
+            bool paused = state->backend->is_paused;
+            state->backend->play_file(state->playlist[state->current_index].c_str(), seconds, paused);
+#else
             state->backend->play_file(state->playlist[state->current_index].c_str(), seconds);
+#endif
             sync_status_timer(state);
             write_status(state);
         }
+#ifdef KINAMP_SPEED
+    } else if (verb == "speed") {
+        char* end = nullptr;
+        errno = 0;
+        double value = strtod(arg.c_str(), &end);
+        if (arg.empty() || end == arg.c_str() || *end != '\0' || errno == ERANGE ||
+            !state->backend->set_speed(value)) {
+            g_printerr("Command: speed requires a finite number from 0.5 to 3.0\n");
+        }
+        // This never toggles pause or restarts the track. A requested change
+        // becomes audible only after already queued old-rate PCM is played.
+        write_status(state);
+#endif
     } else if (verb == "vol") {
         int pct = atoi(arg.c_str());
         if (pct < 0) pct = 0;
