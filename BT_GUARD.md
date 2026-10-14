@@ -50,11 +50,30 @@ ACS child but cannot restore Upstart by itself**; losing both supervisors needs
 explicit recovery. A stalled watchdog expires the binding; disable returns a
 bounded error rather than hanging or claiming restoration.
 
+## Kindle-library shortcut
+
+Tap **Enable Bluetooth Guard** in the normal Kindle library, just like the
+KOReader shortcut. It uses the installed SH_Integration Scriptlet handler:
+`/mnt/us/documents/Enable Bluetooth Guard.sh`, with `# Name:` metadata and
+default FBInk result text. There are no install/run hooks or boot integration.
+The result remains visible briefly, then the handler closes the shortcut.
+
+Tap it after a full reboot, then open KOReader, connect headphones normally,
+and Play. If no player exists yet it reports **waiting for KinAMP**; only the
+accepted root-validated player can later receive protection. Repeated taps on
+a ready session report **already enabled** without restarting any service,
+including during playback. A fresh enable still requires existing KinAMP
+playback stopped (not paused), zero native playback/prevention and exact firmware
+identities. A starting/stalled session is not silently replaced.
+
+Deleting just the library shortcut does not disable the running guard.
+`bt-guard uninstall` restores stock first and removes its owned shortcut too.
+
 ## Commands (root SSH on Kindle)
 
 ```sh
 /var/local/kinamp-bt-guard/bt-guard status
-# After opening KoReadalong and pressing Stop:
+# After reboot, before opening KOReader; Stop first if a player already exists:
 /var/local/kinamp-bt-guard/bt-guard enable
 # Inspect after a few seconds: supervised, nonzero pid/start, until > monotonic_now,
 # stock_job=stopped. An expired or zero binding is NOT playback protection.
@@ -103,13 +122,20 @@ python3 tests/verify_bt_idle_guard.py
 python3 tests/verify_bt_guard_session.py
 ```
 
-The output has binaries, launcher, this document and SHA256SUMS. An authorized
-operator installs those five files root-owned into a new 0755 directory at the
+The output has binaries, launcher, Scriptlet, this document and SHA256SUMS. An authorized
+operator installs those six files root-owned into a new 0755 directory at the
 fixed install path (binaries/launcher0755, library/docs/manifest0644), verifies
 SHA256SUMS on device, privately backs up `/tmp/btfd-acs.err`, then enables with
 playback stopped. Do not overwrite an active install. No proprietary firmware
 or private capture belongs in this repository/package. Source is GPL-3.0 under
 this fork's existing licensing; building does not authorize device installation.
+Copy the owned Scriptlet into `/mnt/us/documents/Enable Bluetooth Guard.sh`;
+the existing scanner indexes it like a book when the normal Kindle framework
+is running. Return to the Kindle library to find it (clear book-only filters).
+The examined session had the scanner service unavailable while KOReader was
+open; do not start it manually or assume a full-scan LIPC request is available.
+No framework restart or application-registry write is needed. Do not overwrite
+an unrelated document.
 
 ## Evidence and limits
 

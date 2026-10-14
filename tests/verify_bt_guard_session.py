@@ -148,7 +148,7 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                  "unknown-on-restore", "externally-started-job", "wrong-job-owner",
                  "symlink-directory", "missing-guard-mapping", "dogfood-disable",
                  "dogfood-controller-killed", "dogfood-watchdog-recovery", "dogfood-rebind-stall",
-                 "dogfood-samepid-exec"]
+                 "dogfood-samepid-exec", "dogfood-no-player", "dogfood-shortcut"]
         for case in cases:
             directory = root / case
             directory.mkdir()
@@ -166,10 +166,13 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
             outsider = subprocess.Popen(["sleep", "60"])
             wait_for(lambda: Path(f"/proc/{player.pid}/exe").resolve() == accepted_player.resolve())
             (root / "player-status").write_text(f"pid={player.pid}\nstate=stopped\ndaemon=1\n")
+            if case in ("dogfood-no-player", "dogfood-shortcut"):
+                (root / "player-status").unlink()
             process = None
             owned = [(original.pid, clock(original.pid)), (player.pid, clock(player.pid)),
                      (outsider.pid, clock(outsider.pid))]
-            log = directory / "session.log"
+            log = (runtime if case == "dogfood-shortcut" else directory) / "session.log"
+            log.touch()
             try:
                 state = {"running": True, "pid": original.pid, "clock": clock(original.pid)}
                 if case == "originally-stopped":
@@ -188,11 +191,42 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                     (directory / "partial-stop").touch()
                 expected_clock = clock(original.pid) + (1 if case == "wrong-startclock" else 0)
                 guard_argument = alias / "guard.so" if case == "symlink-directory" else guard
-                with log.open("w") as stream:
-                    process = subprocess.Popen([str(controller), "0" if dogfood else "2" if case == "normal-expiry" else "20",
-                                                str(original.pid), str(expected_clock), str(player.pid),
-                                                str(clock(player.pid)), str(guard_argument), checksum,
-                                                *([str(runtime)] if dogfood else []), str(helper)],
+                arguments = [str(controller), "0" if dogfood else "2" if case == "normal-expiry" else "20",
+                             str(original.pid), str(expected_clock),
+                             "0" if case == "dogfood-no-player" else str(player.pid),
+                             "0" if case == "dogfood-no-player" else str(clock(player.pid)),
+                             str(guard_argument), checksum, *([str(runtime)] if dogfood else []), str(helper)]
+                if case == "dogfood-shortcut":
+                    # Execute the production shell lifecycle with only paths,
+                    # root UID and firmware job helpers modeled, like the C tests.
+                    install = directory / "install"
+                    install.mkdir()
+                    shutil.copyfile(guard, install / "guard.so")
+                    (install / "SHA256SUMS").write_text(f"{checksum}  guard.so\n")
+                    (install / "session").write_text(f'#!/bin/sh\nexec "{controller}" "$@" "{helper}"\n')
+                    (install / "session").chmod(0o755)
+                    bin_dir = directory / "bin"
+                    bin_dir.mkdir()
+                    (bin_dir / "id").write_text("#!/bin/sh\necho 0\n")
+                    (bin_dir / "id").chmod(0o755)
+                    (bin_dir / "chown").write_text("#!/bin/sh\nexit 0\n")
+                    (bin_dir / "chown").chmod(0o755)
+                    env["PATH"] = f'{bin_dir}:{env["PATH"]}'
+                    launcher = (source / "scripts/bt-guard").read_text().replace(
+                        "I=/var/local/kinamp-bt-guard", f'I="{install}"').replace(
+                        "R=/var/tmp/kinamp-bt-guard", f'R="{runtime}"').replace(
+                        "/tmp/kinamp_status", str(root / "player-status")).replace(
+                        "/usr/bin/acsbtfd", str(worker))
+                    shortcut_control = directory / "bt-guard"
+                    shortcut_control.write_text(launcher)
+                    shortcut_control.chmod(0o755)
+                    scriptlet = directory / "Enable Bluetooth Guard.sh"
+                    scriptlet.write_text((source / "scripts/Enable Bluetooth Guard.sh").read_text().replace(
+                        "G=/var/local/kinamp-bt-guard/bt-guard", f'G="{shortcut_control}"'))
+                    arguments = ["sh", str(scriptlet)]
+                output = directory / "shortcut-output.log" if case == "dogfood-shortcut" else log
+                with output.open("w") as stream:
+                    process = subprocess.Popen(arguments,
                                                env=env, stdout=stream, stderr=stream)
                 rejected = case in ("wrong-startclock", "unknown-initial-job", "originally-stopped",
                                     "baseline-nonzero", "native-baseline-nonzero", "wrong-job-owner")
@@ -222,7 +256,10 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                     assert "ACTIVE" not in log.read_text()
                     assert "RESTORED" in log.read_text()
                 else:
-                    wait_for(lambda: "ACTIVE" in log.read_text())
+                    try:
+                        wait_for(lambda: "ACTIVE" in log.read_text())
+                    except AssertionError as error:
+                        raise AssertionError(log.read_text()) from error
                     match = re.search(r"ACTIVE watchdog=(\d+) child=(\d+) start=(\d+)", log.read_text())
                     watchdog, child, child_clock = map(int, match.groups())
                     assert clock(child) == child_clock and alive(child)
@@ -230,12 +267,23 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                     assert (directory / f"worker-{child}").read_text() == (directory / f"worker-{original.pid}").read_text()
                     if dogfood:
                         binding = runtime / "binding"
+                        if case in ("dogfood-no-player", "dogfood-shortcut"):
+                            wait_for(lambda: binding.exists() and "pid=0\n" in binding.read_text())
+                            result = subprocess.run([str(controller), "--ready", str(runtime), str(helper)],
+                                                    env=env, capture_output=True, timeout=3)
+                            assert result.returncode == 0 and b"waiting for KinAMP" in result.stdout
+                            if case == "dogfood-shortcut":
+                                assert process.wait(timeout=10) == 0
+                                assert "waiting for KinAMP" in output.read_text()
+                            (root / "player-status").write_text(f"pid={player.pid}\nstate=stopped\ndaemon=1\n")
                         wait_for(lambda: binding.exists() and f"pid={player.pid}\n" in binding.read_text())
                         assert binding.stat().st_mode & 0o777 == 0o444
                         assert (runtime / "control").stat().st_mode & 0o777 == 0o600
                         result = subprocess.run([str(controller), "--status", str(runtime), str(helper)],
                                                 env=env, capture_output=True, timeout=3)
                         assert result.returncode == 0 and b"session supervised" in result.stdout
+                        subprocess.run([str(controller), "--ready", str(runtime), str(helper)],
+                                       env=env, check=True, timeout=3, stdout=subprocess.DEVNULL)
                     if case in ("controller-killed", "dogfood-controller-killed"):
                         process.kill()
                         process.wait(timeout=2)
@@ -263,7 +311,16 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                                            env=env, check=True, timeout=4, stdout=subprocess.DEVNULL)
                         else:
                             subprocess.run([str(helper), "start"], env=env, check=True, stdout=subprocess.DEVNULL)
-                    elif case in ("dogfood-disable", "dogfood-rebind-stall", "dogfood-samepid-exec"):
+                    elif case in ("dogfood-disable", "dogfood-rebind-stall", "dogfood-samepid-exec",
+                                  "dogfood-no-player", "dogfood-shortcut"):
+                        if case == "dogfood-shortcut":
+                            assert process.wait(timeout=5) == 0
+                            (root / "player-status").write_text(f"pid={player.pid}\nstate=playing\ndaemon=1\n")
+                            result = subprocess.run(["sh", str(scriptlet)], env=env,
+                                                    capture_output=True, timeout=10)
+                            assert result.returncode == 0 and b"Already enabled" in result.stdout
+                            assert alive(child) and clock(child) == child_clock, "repeat tap must not replace ACS"
+                            (root / "player-status").write_text(f"pid={player.pid}\nstate=stopped\ndaemon=1\n")
                         if case == "dogfood-disable":
                             process.send_signal(signal.SIGHUP)
                             time.sleep(0.2)
@@ -286,6 +343,9 @@ int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
                             time.sleep(16)
                             assert binding.read_text() == captured
                             assert float(captured.split("until=")[1]) < time.monotonic(), "stalled renewal must expire"
+                            result = subprocess.run([str(controller), "--ready", str(runtime), str(helper)],
+                                                    env=env, capture_output=True, timeout=3)
+                            assert result.returncode == 2, "a held lock must not imply ready when renewal expired"
                             os.kill(watchdog, signal.SIGCONT)
                             wait_for(lambda: binding.read_text() != captured)
                         subprocess.run([str(controller), "--disable", str(runtime), str(helper)],

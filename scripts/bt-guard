@@ -35,13 +35,24 @@ case "${1:-status}" in
         disable
         # Do not delete anything while restoration is unknown or incomplete.
         rm -f "$I/guard.so" "$I/session" "$I/SHA256SUMS" "$I/bt-guard" "$I/BT_GUARD.md"
+        rm -f "$I/Enable Bluetooth Guard.sh" /mnt/us/documents/Enable\ Bluetooth\ Guard.sh
         rm -f "$R/lock" "$R/control" "$R/binding" "$R/ownership" "$R/session.log"
         [ ! -d "$R" ] || rmdir "$R"
         rmdir "$I"
         echo 'uninstalled; stock job verified running' ;;
     enable)
+        if [ -f "$R/lock" ]; then
+            if "$I/session" --ready "$R"; then
+                echo 'Already enabled; no services restarted.'
+                exit 0
+            fi
+            if "$I/session" --status "$R" | grep -q '^session supervised'; then
+                echo 'Session starting or stalled; refusing to replace it. Check status/recovery.'
+                exit 1
+            fi
+        fi
         stopped
-        (cd "$I" && sha256sum -c SHA256SUMS)
+        (cd "$I" && sha256sum -c SHA256SUMS) >/dev/null
         [ ! -L "$R" ] || exit 1
         mkdir -p "$R"
         chown root:root "$R"
@@ -55,16 +66,32 @@ case "${1:-status}" in
             fi
         done
         [ -n "$worker" ] || { echo 'stock worker missing; inspect status/recover'; exit 1; }
-        player=$(sed -n 's/^pid=//p' /tmp/kinamp_status)
+        player=0
+        if [ -f /tmp/kinamp_status ]; then player=$(sed -n 's/^pid=//p' /tmp/kinamp_status); fi
         case "$player" in ''|*[!0-9]*) exit 1;; esac
+        player_start=0
+        if [ "$player" -gt 1 ] && [ -d "/proc/$player" ]; then
+            player_start=$(clock "$player")
+        else
+            player=0
+        fi
         # Keep private log; never publish the daemon's addresses/environment.
         umask 077
         touch "$R/session.log"
         chmod 600 "$R/session.log"
         checksum=$(sha256sum "$I/guard.so" | awk '{print $1}')
-        nohup "$I/session" 0 "$worker" "$(clock "$worker")" "$player" "$(clock "$player")" \
+        nohup "$I/session" 0 "$worker" "$(clock "$worker")" "$player" "$player_start" \
             "$I/guard.so" "$checksum" "$R" </dev/null >>"$R/session.log" 2>&1 &
-        echo 'starting; check status for a fresh nonzero binding and stock_job=stopped'
-        echo 'Setup can disconnect Bluetooth/restart audiomgr; reconnect normally before Play.' ;;
+        controller=$!
+        for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            if "$I/session" --ready "$R"; then
+                echo 'Reconnect headphones normally before Play.'
+                exit 0
+            fi
+            kill -0 "$controller" 2>/dev/null || break
+            sleep 1
+        done
+        echo 'Enable not confirmed. Check status/recovery; no automatic retry.'
+        exit 1 ;;
     *) echo 'usage: bt-guard [status|enable|disable|recover|uninstall]'; exit 64 ;;
 esac

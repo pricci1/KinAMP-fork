@@ -358,7 +358,7 @@ static int watchdog(int control, int ready) {
     char **env; char out[512]; int stopped = 0, active = 0; pid_t child = 0;
     if (setsid() < 0 || job_state(&job_pid) != 1 || !baseline_zero() ||
             !identity(stock_worker, &clock, &parent) || clock != stock_clock ||
-            (stock_worker != job_pid && parent != job_pid) || !same(player, player_clock) ||
+            (stock_worker != job_pid && parent != job_pid) || (player && !same(player, player_clock)) ||
             !executable_is(stock_worker, ACS_EXE) ||
             !credentials(&uid, &gid, groups, &group_count, &mask) || !(env = worker_environment())) {
         note("ABORT before stop: identity/job/power/environment gate"); return 1;
@@ -372,7 +372,7 @@ static int watchdog(int control, int ready) {
 #ifndef GUARD_SESSION_HOST_TEST
     char proc_exe[80]; snprintf(proc_exe, sizeof(proc_exe), "/proc/%ld/exe", (long)player);
     if (geteuid() != 0 || uid != 1003 || gid != 150 ||
-            !hash_is(ACS_EXE, ACS_SHA) || !hash_is(proc_exe, PLAYER_SHA) ||
+            !hash_is(ACS_EXE, ACS_SHA) || (player && !hash_is(proc_exe, PLAYER_SHA)) ||
             !hash_is("/usr/lib/libacsbtfdlib.so.1.0", ACS_LIB_SHA) ||
             !hash_is("/etc/upstart/acsbtfd.conf", ACS_JOB_SHA)) {
         note("ABORT before stop: firmware/player/credential gate"); return 1;
@@ -397,7 +397,7 @@ static int watchdog(int control, int ready) {
     /* Recheck after arm; refuse a changed/reused worker, job or power baseline. */
     if (job_state(&job_pid) != 1 || !identity(stock_worker, &clock, &parent) ||
             clock != stock_clock || (stock_worker != job_pid && parent != job_pid) ||
-            !baseline_zero() || !same(player, player_clock)) return 1;
+            !baseline_zero() || (player && !same(player, player_clock))) return 1;
     struct pollfd preflight = {control, POLLIN | POLLHUP, 0};
     if (interrupted || poll(&preflight, 1, 0) > 0) return 1;
     double deadline = now() + seconds;
@@ -464,6 +464,49 @@ static int control_operation(const char *action, const char *directory) {
     if (fd < 0) return 1;
     int idle = !flock(fd, LOCK_EX | LOCK_NB);
     if (!idle && errno != EWOULDBLOCK) { close(fd); return 1; }
+    if (!strcmp(action, "--ready")) {
+        /* Read-only readiness, not just a held lock or a previous ACTIVE log.
+         * This works while waiting for an accepted player after reboot, too. */
+        long worker = 0, wd = 0, bound = 0;
+        unsigned long long start = 0, bound_start = 0, wd_clock;
+        double until = 0;
+        snprintf(path, sizeof(path), "%s/ownership", directory);
+        int record = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        int valid = !idle && record >= 0 && !fstat(record, &st) && S_ISREG(st.st_mode) &&
+            st.st_uid == geteuid() && !(st.st_mode & 077);
+        ssize_t n = valid ? read(record, bytes, sizeof(bytes) - 1) : -1;
+        if (record >= 0) close(record);
+        if (n > 0) {
+            bytes[n] = 0;
+            char *save, *line = strtok_r(bytes, "\n", &save);
+            for (; line; line = strtok_r(NULL, "\n", &save)) {
+                if (sscanf(line, "acs=%ld", &worker) == 1) continue;
+                if (sscanf(line, "acs_start=%llu", &start) == 1) continue;
+                sscanf(line, "watchdog=%ld", &wd);
+            }
+        }
+        pid_t parent = 0, ignored;
+        unsigned long long actual = 0;
+        valid = n > 0 && worker > 1 && worker <= 0x7fffffff && wd > 1 && wd <= 0x7fffffff &&
+            identity((pid_t)worker, &actual, &parent) && actual == start && parent == wd &&
+            executable_is((pid_t)worker, ACS_EXE) && identity((pid_t)wd, &wd_clock, &ignored);
+        snprintf(path, sizeof(path), "%s/binding", directory);
+        int binding = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        valid = valid && binding >= 0 && !fstat(binding, &st) && S_ISREG(st.st_mode) &&
+            st.st_uid == geteuid() && !(st.st_mode & 0222) && st.st_size < (off_t)sizeof(bytes);
+        n = valid ? read(binding, bytes, sizeof(bytes) - 1) : -1;
+        if (binding >= 0) close(binding);
+        if (n > 0) {
+            bytes[n] = 0;
+            char extra;
+            valid = sscanf(bytes, "pid=%ld\nstart=%llu\nuntil=%lf\n%c", &bound, &bound_start, &until, &extra) == 3 &&
+                until > now() && until <= now() + 15.1 &&
+                ((!bound && !bound_start) || (bound > 1 && bound <= 0x7fffffff && same((pid_t)bound, bound_start)));
+        } else valid = 0;
+        close(fd);
+        if (valid) puts(bound ? "Bluetooth guard enabled." : "Bluetooth guard enabled; waiting for KinAMP.");
+        return valid ? 0 : 2;
+    }
     if (!strcmp(action, "--disable") && !idle) {
         snprintf(path, sizeof(path), "%s/control", directory);
         int control = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
@@ -517,7 +560,8 @@ int main(int argc, char **argv) {
         helper = argv[3]; return control_operation(argv[1], argv[2]);
     }
 #else
-    if (argc == 3 && (!strcmp(argv[1], "--status") || !strcmp(argv[1], "--disable") || !strcmp(argv[1], "--recover"))) {
+    if (argc == 3 && (!strcmp(argv[1], "--status") || !strcmp(argv[1], "--disable") ||
+            !strcmp(argv[1], "--recover") || !strcmp(argv[1], "--ready"))) {
         if (geteuid() != 0) return 1;
         return control_operation(argv[1], argv[2]);
     }
@@ -536,8 +580,8 @@ int main(int argc, char **argv) {
     if (*end || (!seconds && !runtime) || seconds > 3600 || (runtime && seconds)) return 64;
     stock_worker = (pid_t)strtol(argv[2], &end, 10); if (*end || stock_worker < 2) return 64;
     stock_clock = strtoull(argv[3], &end, 10); if (*end || !stock_clock) return 64;
-    player = (pid_t)strtol(argv[4], &end, 10); if (*end || player < 2) return 64;
-    player_clock = strtoull(argv[5], &end, 10); if (*end || !player_clock) return 64;
+    player = (pid_t)strtol(argv[4], &end, 10); if (*end || player < 0 || player == 1 || (!runtime && !player)) return 64;
+    player_clock = strtoull(argv[5], &end, 10); if (*end || (!player != !player_clock)) return 64;
     guard_path = argv[6]; guard_sha = argv[7];
     if (guard_path[0] != '/' || strlen(guard_sha) != 64 || strspn(guard_sha, "0123456789abcdef") != 64) return 64;
     if (runtime) {
