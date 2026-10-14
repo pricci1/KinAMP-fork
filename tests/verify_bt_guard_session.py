@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,16 @@ int main(void) {
 }
 ''')
         subprocess.run(["gcc", "-Wall", "-Wextra", "-Werror", str(worker_source), "-o", str(worker)], check=True)
+        player_model = root / "player-model"
+        player_source = root / "player.c"
+        player_source.write_text('''#include <signal.h>
+#include <unistd.h>
+static void change(int sig) {
+    (void)sig; execl("/bin/sleep", "/bin/sleep", "60", (char *)0); _exit(1);
+}
+int main(void) { signal(SIGUSR1, change); for (;;) pause(); }
+''')
+        subprocess.run(["gcc", "-Wall", "-Wextra", "-Werror", str(player_source), "-o", str(player_model)], check=True)
         guard = root / "guard.so"
         subprocess.run(["gcc", "-Wall", "-Wextra", "-Werror", "-fPIC", "-shared",
                         str(source / "kindle_bt_idle_guard.c"), "-ldl", "-o", str(guard)], check=True)
@@ -125,6 +136,7 @@ int main(void) {
         controller = root / "session"
         subprocess.run(["gcc", "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror",
                         "-DGUARD_SESSION_HOST_TEST", f'-DACS_EXE="{worker}"',
+                        f'-DPLAYER_STATUS="{root / "player-status"}"',
                         str(source / "kindle_bt_guard_session.c"), "-o", str(controller)], check=True)
         helper = root / "helper"
         helper.write_text(f"#!/bin/sh\nexec {sys.executable} {Path(__file__).resolve()} --job \"$@\"\n")
@@ -134,17 +146,26 @@ int main(void) {
                  "unknown-initial-job", "originally-stopped", "baseline-nonzero",
                  "native-baseline-nonzero",
                  "unknown-on-restore", "externally-started-job", "wrong-job-owner",
-                 "symlink-directory", "missing-guard-mapping"]
+                 "symlink-directory", "missing-guard-mapping", "dogfood-disable",
+                 "dogfood-controller-killed", "dogfood-watchdog-recovery", "dogfood-rebind-stall",
+                 "dogfood-samepid-exec"]
         for case in cases:
             directory = root / case
             directory.mkdir()
+            runtime = directory / "runtime"
+            runtime.mkdir(mode=0o755)
+            dogfood = case.startswith("dogfood-")
+            accepted_player = player_model if case == "dogfood-samepid-exec" else Path(shutil.which("sleep"))
             env = {**os.environ, "MODEL_DIR": str(directory), "MODEL_WORKER": str(worker),
-                   "MODEL_KEEP": "original-worker-environment"}
+                   "MODEL_KEEP": "original-worker-environment",
+                   "MODEL_PLAYER_SHA": hashlib.sha256(accepted_player.read_bytes()).hexdigest()}
             if case == "missing-guard-mapping":
                 env["MODEL_OMIT_GUARD"] = "1"
             original = subprocess.Popen([str(worker), "-f"], env=env)
-            player = subprocess.Popen(["sleep", "60"])
+            player = subprocess.Popen([str(player_model)] if case == "dogfood-samepid-exec" else ["sleep", "60"])
             outsider = subprocess.Popen(["sleep", "60"])
+            wait_for(lambda: Path(f"/proc/{player.pid}/exe").resolve() == accepted_player.resolve())
+            (root / "player-status").write_text(f"pid={player.pid}\nstate=stopped\ndaemon=1\n")
             process = None
             owned = [(original.pid, clock(original.pid)), (player.pid, clock(player.pid)),
                      (outsider.pid, clock(outsider.pid))]
@@ -168,9 +189,10 @@ int main(void) {
                 expected_clock = clock(original.pid) + (1 if case == "wrong-startclock" else 0)
                 guard_argument = alias / "guard.so" if case == "symlink-directory" else guard
                 with log.open("w") as stream:
-                    process = subprocess.Popen([str(controller), "2" if case == "normal-expiry" else "20",
+                    process = subprocess.Popen([str(controller), "0" if dogfood else "2" if case == "normal-expiry" else "20",
                                                 str(original.pid), str(expected_clock), str(player.pid),
-                                                str(clock(player.pid)), str(guard_argument), checksum, str(helper)],
+                                                str(clock(player.pid)), str(guard_argument), checksum,
+                                                *([str(runtime)] if dogfood else []), str(helper)],
                                                env=env, stdout=stream, stderr=stream)
                 rejected = case in ("wrong-startclock", "unknown-initial-job", "originally-stopped",
                                     "baseline-nonzero", "native-baseline-nonzero", "wrong-job-owner")
@@ -206,21 +228,69 @@ int main(void) {
                     assert clock(child) == child_clock and alive(child)
                     wait_for(lambda: (directory / f"worker-{child}").exists())
                     assert (directory / f"worker-{child}").read_text() == (directory / f"worker-{original.pid}").read_text()
-                    if case == "controller-killed":
+                    if dogfood:
+                        binding = runtime / "binding"
+                        wait_for(lambda: binding.exists() and f"pid={player.pid}\n" in binding.read_text())
+                        assert binding.stat().st_mode & 0o777 == 0o444
+                        assert (runtime / "control").stat().st_mode & 0o777 == 0o600
+                        result = subprocess.run([str(controller), "--status", str(runtime), str(helper)],
+                                                env=env, capture_output=True, timeout=3)
+                        assert result.returncode == 0 and b"session supervised" in result.stdout
+                    if case in ("controller-killed", "dogfood-controller-killed"):
                         process.kill()
                         process.wait(timeout=2)
                         wait_for(lambda: "RESTORED" in log.read_text())
                     elif case == "worker-crash":
                         os.kill(child, signal.SIGKILL)
                         assert process.wait(timeout=5) == 0
-                    elif case == "watchdog-killed":
+                    elif case in ("watchdog-killed", "dogfood-watchdog-recovery"):
                         os.kill(watchdog, signal.SIGKILL)
                         assert process.wait(timeout=5) == 3
                         wait_for(lambda: not alive(child))
                         assert not json.loads((directory / "job.json").read_text())["running"]
                         # Deliberately not automatic recovery: the operator must
                         # verify child gone + known stopped job before starting.
-                        subprocess.run([str(helper), "start"], env=env, check=True, stdout=subprocess.DEVNULL)
+                        if dogfood:
+                            result = subprocess.run([str(controller), "--disable", str(runtime), str(helper)],
+                                                    env=env, capture_output=True, timeout=3)
+                            assert result.returncode == 2, "dead reader must not hang or imply restoration"
+                            (runtime / "ownership").chmod(0o666)
+                            result = subprocess.run([str(controller), "--recover", str(runtime), str(helper)],
+                                                    env=env, capture_output=True, timeout=3)
+                            assert result.returncode == 2, "unowned manifest must refuse recovery"
+                            (runtime / "ownership").chmod(0o600)
+                            subprocess.run([str(controller), "--recover", str(runtime), str(helper)],
+                                           env=env, check=True, timeout=4, stdout=subprocess.DEVNULL)
+                        else:
+                            subprocess.run([str(helper), "start"], env=env, check=True, stdout=subprocess.DEVNULL)
+                    elif case in ("dogfood-disable", "dogfood-rebind-stall", "dogfood-samepid-exec"):
+                        if case == "dogfood-disable":
+                            process.send_signal(signal.SIGHUP)
+                            time.sleep(0.2)
+                            assert process.poll() is None, "SSH hangup must not disable dogfooding"
+                        if case == "dogfood-samepid-exec":
+                            original_start = clock(player.pid)
+                            os.kill(player.pid, signal.SIGUSR1)
+                            wait_for(lambda: Path(f"/proc/{player.pid}/exe").resolve().name == "sleep")
+                            assert clock(player.pid) == original_start
+                            wait_for(lambda: "pid=0\n" in binding.read_text())
+                        if case == "dogfood-rebind-stall":
+                            (root / "player-status").write_text(f"pid={outsider.pid}\n")
+                            wait_for(lambda: f"pid={outsider.pid}\n" in binding.read_text())
+                            (root / "player-status").write_text(f"pid={child}\n")
+                            wait_for(lambda: "pid=0\n" in binding.read_text())
+                            (root / "player-status").write_text(f"pid={player.pid}\n")
+                            wait_for(lambda: f"pid={player.pid}\n" in binding.read_text())
+                            os.kill(watchdog, signal.SIGSTOP)
+                            captured = binding.read_text()
+                            time.sleep(16)
+                            assert binding.read_text() == captured
+                            assert float(captured.split("until=")[1]) < time.monotonic(), "stalled renewal must expire"
+                            os.kill(watchdog, signal.SIGCONT)
+                            wait_for(lambda: binding.read_text() != captured)
+                        subprocess.run([str(controller), "--disable", str(runtime), str(helper)],
+                                       env=env, check=True, timeout=8, stdout=subprocess.DEVNULL)
+                        assert process.wait(timeout=4) == 0
                     elif case == "unknown-on-restore":
                         (directory / "unknown").touch()
                         process.terminate()

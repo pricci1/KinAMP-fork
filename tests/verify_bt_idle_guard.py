@@ -163,6 +163,42 @@ def main():
             write()
             assert step(driver, "poll") == 1, "hard experiment bound must expire even if fresh"
             close(driver)
+            binding = work / "binding"
+
+            def bind(pid, start, lifetime=1):
+                temporary = work / "binding.tmp"
+                temporary.write_text(f"pid={pid}\nstart={start}\nuntil={time.monotonic() + lifetime:.3f}\n")
+                temporary.chmod(0o444)
+                temporary.replace(binding)
+
+            bind(owner.pid, starttime(owner.pid))
+            driver = session(KINAMP_BT_GUARD_BINDING=str(binding), KINAMP_BT_GUARD_SECONDS="0")
+            write()
+            assert step(driver, "arm") == 0
+            time.sleep(1.1)
+            write()
+            assert step(driver, "poll") == 1, "stalled handoff must expire despite fresh playing status"
+            bind(owner.pid, starttime(owner.pid))
+            assert step(driver, "arm") == 1, "renewal permits a new existing timer"
+            bind(owner.pid, 1)
+            assert step(driver, "poll") == 2, "wrong start clock must fail closed"
+            bind(owner.pid, starttime(owner.pid), lifetime=60)
+            assert step(driver, "arm") == 3, "unbounded handoff must be rejected"
+            bind(owner.pid, starttime(owner.pid))
+            binding.chmod(0o644)
+            assert step(driver, "arm") == 4, "writable handoff must be rejected"
+            replacement = subprocess.Popen(["sleep", "10"])
+            try:
+                bind(replacement.pid, starttime(replacement.pid))
+                write(pid=replacement.pid)
+                assert step(driver, "arm") == 4, "new verified binding may protect a restarted player"
+                write("paused", pid=replacement.pid)
+                assert step(driver, "poll") == 5, "rebound player pause still delegates"
+            finally:
+                replacement.terminate()
+                replacement.wait(timeout=3)
+            close(driver)
+            write()
             driver = session()
             assert step(driver, "arm") == 0
             owner.terminate()
@@ -171,7 +207,8 @@ def main():
             assert step(driver, "poll") == 1, "dead owner must not hold link even with fresh status"
             close(driver)
             print("PASS: baseline failure; repeated deadlines; pause/stop/close/stale/crash; "
-                  "native cancellation/rearm; reconnect; unowned identity; ABI gate; hard expiry")
+                  "native cancellation/rearm; reconnect; unowned identity; ABI gate; hard expiry; "
+                  "handoff renewal/stall/rebind/permissions/horizon")
         finally:
             if owner.poll() is None:
                 owner.terminate()

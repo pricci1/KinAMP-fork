@@ -1,0 +1,70 @@
+#!/bin/sh
+# Experimental PW6 ACS policy. No boot hook, firmware edits or radio commands.
+set -eu
+I=/var/local/kinamp-bt-guard
+R=/var/tmp/kinamp-bt-guard
+[ "$(id -u)" = 0 ] || { echo 'root required'; exit 1; }
+clock() { sed 's/.*) //' "/proc/$1/stat" | awk '{print $20}'; }
+stopped() {
+    [ -f /tmp/kinamp_status ] || return 0
+    pid=$(sed -n 's/^pid=//p' /tmp/kinamp_status)
+    case "$pid" in ''|*[!0-9]*) echo 'unknown player identity'; exit 1;; esac
+    [ -d "/proc/$pid" ] || return 0
+    [ "$(sed -n 's/^state=//p' /tmp/kinamp_status)" = stopped ] || {
+        echo 'Press Stop in KoReadalong first (pause is not enough).'; exit 1;
+    }
+}
+disable() {
+    if [ -f "$R/lock" ]; then "$I/session" --disable "$R"; return; fi
+    # Nothing was enabled this boot: do not guess a missing stock job.
+    case "$(/sbin/status acsbtfd)" in 'acsbtfd start/running, process '*) return;; esac
+    echo 'stock not running and no owned recovery record; inspect manually'; exit 2
+}
+case "${1:-status}" in
+    status)
+        if [ ! -f "$R/lock" ]; then echo 'session inactive (stock after reboot)'; /sbin/status acsbtfd; exit; fi
+        exec "$I/session" --status "$R" ;;
+    disable)
+        stopped
+        disable ;;
+    recover)
+        stopped
+        exec "$I/session" --recover "$R" ;;
+    uninstall)
+        stopped
+        disable
+        # Do not delete anything while restoration is unknown or incomplete.
+        rm -f "$I/guard.so" "$I/session" "$I/SHA256SUMS" "$I/bt-guard" "$I/BT_GUARD.md"
+        rm -f "$R/lock" "$R/control" "$R/binding" "$R/ownership" "$R/session.log"
+        [ ! -d "$R" ] || rmdir "$R"
+        rmdir "$I"
+        echo 'uninstalled; stock job verified running' ;;
+    enable)
+        stopped
+        (cd "$I" && sha256sum -c SHA256SUMS)
+        [ ! -L "$R" ] || exit 1
+        mkdir -p "$R"
+        chown root:root "$R"
+        chmod 755 "$R"
+        # Find the actual executing stock worker, not a stale pidfile/wrapper.
+        worker=''
+        for file in /proc/[0-9]*/exe; do
+            if [ "$(readlink "$file" 2>/dev/null || true)" = /usr/bin/acsbtfd ]; then
+                [ -z "$worker" ] || { echo 'multiple ACS workers; refusing'; exit 1; }
+                worker=${file#/proc/}; worker=${worker%/exe}
+            fi
+        done
+        [ -n "$worker" ] || { echo 'stock worker missing; inspect status/recover'; exit 1; }
+        player=$(sed -n 's/^pid=//p' /tmp/kinamp_status)
+        case "$player" in ''|*[!0-9]*) exit 1;; esac
+        # Keep private log; never publish the daemon's addresses/environment.
+        umask 077
+        touch "$R/session.log"
+        chmod 600 "$R/session.log"
+        checksum=$(sha256sum "$I/guard.so" | awk '{print $1}')
+        nohup "$I/session" 0 "$worker" "$(clock "$worker")" "$player" "$(clock "$player")" \
+            "$I/guard.so" "$checksum" "$R" </dev/null >>"$R/session.log" 2>&1 &
+        echo 'starting; check status for a fresh nonzero binding and stock_job=stopped'
+        echo 'Setup can disconnect Bluetooth/restart audiomgr; reconnect normally before Play.' ;;
+    *) echo 'usage: bt-guard [status|enable|disable|recover|uninstall]'; exit 64 ;;
+esac

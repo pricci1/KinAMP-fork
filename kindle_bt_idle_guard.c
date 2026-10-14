@@ -25,6 +25,7 @@ static TimerCallback disconnect_callback;
 static long owner_pid;
 static unsigned long long owner_start;
 static const char *status_path;
+static const char *binding_path;
 static double expires;
 static int enabled;
 
@@ -49,9 +50,12 @@ __attribute__((constructor)) static void initialize(void) {
     unsigned long long seconds = env_number("KINAMP_BT_GUARD_SECONDS");
     owner_start = env_number("KINAMP_BT_GUARD_STARTTIME");
     status_path = getenv("KINAMP_BT_GUARD_STATUS");
+    binding_path = getenv("KINAMP_BT_GUARD_BINDING");
     double now = monotonic_now();
     enabled = real_start && pid && pid <= 0x7fffffff && owner_start &&
         seconds && seconds <= 3600 && status_path && status_path[0] == '/' && now >= 0;
+    if (binding_path && binding_path[0] == '/' && real_start && status_path &&
+            status_path[0] == '/' && now >= 0) enabled = 1;
     owner_pid = (long)pid;
     expires = now + seconds;
 #ifndef KINAMP_BT_GUARD_HOST_TEST
@@ -90,6 +94,34 @@ static int owner_is_alive(void) {
 
 static int owner_is_playing(void) {
     double now = monotonic_now();
+    if (binding_path) {
+        /* Root periodically revalidates the executable, credentials and start
+         * clock. ACS needs only this read-only, short-lived identity handoff;
+         * bluetooth cannot necessarily inspect a root player's /proc/exe. */
+        int binding = open(binding_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+        if (binding < 0) return 0;
+        struct stat st;
+        char bytes[256], extra;
+        long pid = 0;
+        unsigned long long start = 0;
+        double until = 0;
+#ifdef KINAMP_BT_GUARD_HOST_TEST
+        uid_t uid = geteuid();
+#else
+        uid_t uid = 0;
+#endif
+        int valid = !fstat(binding, &st) && S_ISREG(st.st_mode) && st.st_uid == uid &&
+            !(st.st_mode & 0222) && st.st_size > 0 && st.st_size < (off_t)sizeof(bytes);
+        ssize_t count = valid ? read(binding, bytes, sizeof(bytes) - 1) : -1;
+        close(binding);
+        if (count <= 0) return 0;
+        bytes[count] = 0;
+        if (sscanf(bytes, "pid=%ld\nstart=%llu\nuntil=%lf\n%c", &pid, &start, &until, &extra) != 3 ||
+                pid < 2 || pid > 0x7fffffff || !start || !(until > now) || until > now + 15.1) return 0;
+        owner_pid = pid;
+        owner_start = start;
+        expires = until;
+    }
     if (!enabled || now < 0 || now >= expires || !owner_is_alive()) return 0;
     int fd = open(status_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return 0;

@@ -1,9 +1,10 @@
-/* Bounded diagnostic only. No install, power override or Bluetooth commands.
+/* Diagnostic or explicitly enabled experimental dogfooding session.
  * The detached watchdog owns its unreaped direct child, never an external PID.
  * Losing the controller's pipe restores the originally running Upstart job.
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
@@ -12,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -30,6 +32,11 @@ static const char *guard_path, *guard_sha;
 static pid_t stock_worker, player;
 static unsigned long long stock_clock, player_clock;
 static unsigned seconds;
+static const char *runtime;
+static int lock_fd = -1, fifo_fd = -1;
+#ifndef PLAYER_STATUS
+#define PLAYER_STATUS "/tmp/kinamp_status"
+#endif
 #ifdef GUARD_SESSION_HOST_TEST
 static const char *helper;
 #endif
@@ -148,6 +155,33 @@ static int executable_is(pid_t pid, const char *expected_path) {
     if (n < 0) return 0;
     link[n] = 0; return !strcmp(link, expected_path);
 }
+static int acs_absent(void) {
+    DIR *proc = opendir("/proc"); struct dirent *entry;
+    if (!proc) return 0;
+    int absent = 1;
+    while ((entry = readdir(proc))) {
+        if (strspn(entry->d_name, "0123456789") != strlen(entry->d_name)) continue;
+        char path[80], link[1024];
+#ifdef GUARD_SESSION_HOST_TEST
+        /* Unprivileged disposable harness cannot inspect unrelated root jobs.
+         * Target runs as root and must fail on any unreadable process. */
+        struct stat directory;
+        snprintf(path, sizeof(path), "/proc/%ld", strtol(entry->d_name, NULL, 10));
+        if (stat(path, &directory) || directory.st_uid != geteuid()) continue;
+#endif
+        snprintf(path, sizeof(path), "/proc/%ld/exe", strtol(entry->d_name, NULL, 10));
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n < 0) {
+#ifndef GUARD_SESSION_HOST_TEST
+            if (errno != ENOENT && errno != ESRCH) absent = 0;
+#endif
+            continue;
+        }
+        link[n] = 0;
+        if (!strcmp(link, ACS_EXE) || !strcmp(link, ACS_EXE " (deleted)")) absent = 0;
+    }
+    closedir(proc); return absent;
+}
 /* Environment stays private in memory. Add to, rather than erase, any original
  * preloads. Use original worker credentials/groups, not a root ACS daemon. */
 static char **worker_environment(void) {
@@ -170,7 +204,8 @@ static char **worker_environment(void) {
     if (asprintf(&env[count++], "KINAMP_BT_GUARD_PID=%ld", (long)player) < 0 ||
             asprintf(&env[count++], "KINAMP_BT_GUARD_STARTTIME=%llu", player_clock) < 0 ||
             asprintf(&env[count++], "KINAMP_BT_GUARD_SECONDS=%u", seconds) < 0) return NULL;
-    env[count++] = strdup("KINAMP_BT_GUARD_STATUS=/tmp/kinamp_status");
+    env[count++] = strdup("KINAMP_BT_GUARD_STATUS=" PLAYER_STATUS);
+    if (runtime && asprintf(&env[count++], "KINAMP_BT_GUARD_BINDING=%s/binding", runtime) < 0) return NULL;
     return env;
 }
 static int credentials(uid_t *uid, gid_t *gid, gid_t *groups, size_t *count, mode_t *mask) {
@@ -231,10 +266,90 @@ static int restore(pid_t child, int stopped) {
     int state = job_state(&job_pid);
     if (state == 1) { note("stock job already running; left untouched"); return 1; }
     if (state != 0) { note("RESTORE BLOCKED: unknown job state; no start/kill"); return 0; }
+    if (!acs_absent()) { note("RESTORE BLOCKED: unowned ACS or unreadable process"); return 0; }
+#ifndef GUARD_SESSION_HOST_TEST
+    if (!hash_is(ACS_EXE, ACS_SHA) || !hash_is("/usr/lib/libacsbtfdlib.so.1.0", ACS_LIB_SHA) ||
+            !hash_is("/etc/upstart/acsbtfd.conf", ACS_JOB_SHA)) {
+        note("RESTORE BLOCKED: changed stock files"); return 0;
+    }
+#endif
     if (!job_command("start", out, sizeof(out)) || job_state(&job_pid) != 1) {
         note("RESTORE FAILED: original job start"); return 0;
     }
     note("RESTORED originally running stock job"); return 1;
+}
+static int runtime_file(const char *name, const char *bytes, mode_t mode) {
+    char path[1024], temporary[1024];
+    if (snprintf(path, sizeof(path), "%s/%s", runtime, name) >= (int)sizeof(path) ||
+            snprintf(temporary, sizeof(temporary), "%s/.%s-%ld", runtime, name, (long)getpid()) >= (int)sizeof(temporary)) return 0;
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return 0;
+    size_t length = strlen(bytes);
+    int ok = write(fd, bytes, length) == (ssize_t)length && !fchmod(fd, mode);
+    close(fd);
+    if (ok) ok = !rename(temporary, path);
+    if (!ok) unlink(temporary);
+    return ok;
+}
+static int player_binding(void) {
+    /* Status is a player assertion, NOT a security boundary. Root validates
+     * the candidate on every refresh; hash is cached only for an unchanged
+     * executable inode/metadata AND unchanged PID/start clock. */
+    static pid_t cached_pid;
+    static unsigned long long cached_clock;
+    static struct stat cached_exe;
+    static int cached_ok;
+    int fd = open(PLAYER_STATUS, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    struct stat status, exe;
+    long candidate = 0;
+    char bytes[4096], path[80];
+    if (fd >= 0) {
+        if (!fstat(fd, &status) && S_ISREG(status.st_mode) && status.st_uid == geteuid() &&
+                status.st_size > 0 && status.st_size < (off_t)sizeof(bytes)) {
+            ssize_t n = read(fd, bytes, sizeof(bytes) - 1);
+            if (n > 0) {
+                bytes[n] = 0;
+                char *save, *line = strtok_r(bytes, "\n", &save);
+                for (; line; line = strtok_r(NULL, "\n", &save)) {
+                    char extra;
+                    if (sscanf(line, "pid=%ld%c", &candidate, &extra) == 1) break;
+                    candidate = 0;
+                }
+            }
+        }
+        close(fd);
+    }
+    unsigned long long clock = 0; pid_t parent;
+    int valid = candidate > 1 && candidate <= 0x7fffffff && identity((pid_t)candidate, &clock, &parent);
+    if (valid) {
+        snprintf(path, sizeof(path), "/proc/%ld/status", candidate);
+        FILE *f = fopen(path, "r");
+        unsigned a, b, c, d; int root = 0;
+        while (f && fgets(bytes, sizeof(bytes), f)) {
+            if (sscanf(bytes, "Uid:\t%u\t%u\t%u\t%u", &a, &b, &c, &d) == 4)
+                root = a == geteuid() && b == a && c == a && d == a;
+        }
+        if (f) fclose(f);
+        snprintf(path, sizeof(path), "/proc/%ld/exe", candidate);
+        valid = root && !stat(path, &exe);
+    }
+    if (valid && (cached_pid != candidate || cached_clock != clock ||
+            cached_exe.st_dev != exe.st_dev || cached_exe.st_ino != exe.st_ino ||
+            cached_exe.st_size != exe.st_size ||
+            cached_exe.st_mtim.tv_sec != exe.st_mtim.tv_sec || cached_exe.st_mtim.tv_nsec != exe.st_mtim.tv_nsec ||
+            cached_exe.st_ctim.tv_sec != exe.st_ctim.tv_sec || cached_exe.st_ctim.tv_nsec != exe.st_ctim.tv_nsec)) {
+#ifdef GUARD_SESSION_HOST_TEST
+        const char *expected = getenv("MODEL_PLAYER_SHA");
+        cached_ok = expected && hash_is(path, expected);
+#else
+        cached_ok = hash_is(path, PLAYER_SHA);
+#endif
+        cached_pid = (pid_t)candidate; cached_clock = clock; cached_exe = exe;
+    }
+    valid = valid && cached_ok && same((pid_t)candidate, clock);
+    snprintf(bytes, sizeof(bytes), "pid=%ld\nstart=%llu\nuntil=%.3f\n",
+        valid ? candidate : 0, valid ? clock : 0, now() + 15);
+    return runtime_file("binding", bytes, 0444);
 }
 static int watchdog(int control, int ready) {
     pid_t job_pid = 0, parent; unsigned long long clock;
@@ -267,6 +382,12 @@ static int watchdog(int control, int ready) {
     if (lstat(guard_path, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
             (st.st_mode & 022) || !hash_is(guard_path, guard_sha)) {
         note("ABORT before stop: guard file gate"); return 1;
+    }
+    if (runtime) {
+        char bytes[256];
+        snprintf(bytes, sizeof(bytes), "originally_running=1\nstock_worker=%ld\nstock_start=%llu\n",
+            (long)stock_worker, stock_clock);
+        if (!runtime_file("ownership", bytes, 0600) || !player_binding()) return 1;
     }
     note("ARMED independent watchdog before stock stop");
     if (write(ready, "R", 1) != 1) return 1;
@@ -311,33 +432,129 @@ static int watchdog(int control, int ready) {
     }
     fprintf(stderr, "bt-guard-session %.3f ACTIVE watchdog=%ld child=%ld start=%llu\n",
         now(), (long)getpid(), (long)child, child_clock);
-    while (!interrupted && now() < deadline && same(child, child_clock)) {
+    if (runtime) {
+        char bytes[256];
+        snprintf(bytes, sizeof(bytes), "originally_running=1\nwatchdog=%ld\nacs=%ld\nacs_start=%llu\nstock_worker=%ld\nstock_start=%llu\n",
+            (long)getpid(), (long)child, child_clock, (long)stock_worker, stock_clock);
+        if (!runtime_file("ownership", bytes, 0600)) goto cleanup;
+    }
+    double refresh = 0;
+    while (!interrupted && (runtime || now() < deadline) && same(child, child_clock)) {
+        if (runtime && now() >= refresh) {
+            if (!player_binding()) break;
+            refresh = now() + 5;
+            pid_t external = 0;
+            if (job_state(&external) != 0) break; /* never coexist with a restarted stock job */
+        }
         struct pollfd p = {control, POLLIN | POLLHUP, 0};
         if (poll(&p, 1, 100) > 0) break; /* normal STOP or controller death/EOF */
     }
 cleanup:
+    if (runtime) runtime_file("binding", "pid=0\nstart=0\nuntil=0\n", 0444);
     note("restoration begins");
     /* Successful restoration alone is not a successful readiness gate. */
     return restore(child, stopped) ? (active ? 0 : 4) : 2;
 }
+static int control_operation(const char *action, const char *directory) {
+    char path[1024], bytes[512]; struct stat st;
+    if (directory[0] != '/' || strlen(directory) > 800 || lstat(directory, &st) ||
+            !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 022)) return 1;
+    snprintf(path, sizeof(path), "%s/lock", directory);
+    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return 1;
+    int idle = !flock(fd, LOCK_EX | LOCK_NB);
+    if (!idle && errno != EWOULDBLOCK) { close(fd); return 1; }
+    if (!strcmp(action, "--disable") && !idle) {
+        snprintf(path, sizeof(path), "%s/control", directory);
+        int control = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        int ok = control >= 0 && !fstat(control, &st) && S_ISFIFO(st.st_mode) &&
+            st.st_uid == geteuid() && !(st.st_mode & 077) && write(control, "S", 1) == 1;
+        if (control >= 0) close(control);
+        double deadline = now() + 30;
+        while (ok && now() < deadline && !(idle = !flock(fd, LOCK_EX | LOCK_NB))) usleep(100000);
+        if (!idle) { puts("disable incomplete: supervisor stalled; see recovery instructions"); close(fd); return 2; }
+    }
+    if (!strcmp(action, "--status")) {
+        puts(idle ? "session inactive" : "session supervised (check binding expiry below)");
+        snprintf(path, sizeof(path), "%s/binding", directory);
+        int binding = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (binding >= 0 && !fstat(binding, &st) && S_ISREG(st.st_mode)) {
+            ssize_t n = read(binding, bytes, sizeof(bytes) - 1);
+            if (n > 0) { bytes[n] = 0; fputs(bytes, stdout); }
+        }
+        if (binding >= 0) close(binding);
+        printf("monotonic_now=%.3f\n", now());
+        pid_t job = 0; int state = job_state(&job);
+        printf("stock_job=%s\n", state == 1 ? "running" : state == 0 ? "stopped" : "unknown");
+        close(fd); return 0;
+    }
+    if (!idle) { close(fd); return 2; }
+    pid_t job = 0;
+    if (job_state(&job) == 1) { puts("stock running; no recovery needed"); close(fd); return 0; }
+    if (strcmp(action, "--recover")) {
+        puts("stock not verified running; run bt-guard recover with playback stopped"); close(fd); return 2;
+    }
+    /* Never signal a PID from a manifest. A held lock or ANY live ACS refuses
+     * recovery. Manifest proves this install previously replaced a running job;
+     * exact stock hashes/state must still match before starting that job. */
+    snprintf(path, sizeof(path), "%s/ownership", directory);
+    int manifest = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    int known = manifest >= 0 && !fstat(manifest, &st) && S_ISREG(st.st_mode) &&
+        st.st_uid == geteuid() && !(st.st_mode & 077);
+    ssize_t n = known ? read(manifest, bytes, sizeof(bytes) - 1) : -1;
+    if (manifest >= 0) close(manifest);
+    known = n >= 21 && !memcmp(bytes, "originally_running=1\n", 21);
+    runtime = directory;
+    int ok = known && baseline_zero() && restore(0, 1);
+    close(fd);
+    if (!ok) puts("recovery refused: unknown ownership/process/job/files or nonzero power/playback; do not kill unknown processes");
+    return ok ? 0 : 2;
+}
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+#ifdef GUARD_SESSION_HOST_TEST
+    if (argc == 4 && !strncmp(argv[1], "--", 2)) {
+        helper = argv[3]; return control_operation(argv[1], argv[2]);
+    }
+#else
+    if (argc == 3 && (!strcmp(argv[1], "--status") || !strcmp(argv[1], "--disable") || !strcmp(argv[1], "--recover"))) {
+        if (geteuid() != 0) return 1;
+        return control_operation(argv[1], argv[2]);
+    }
+#endif
     /* Exact args, identities freshly sampled by the approved operator. */
 #ifdef GUARD_SESSION_HOST_TEST
-    if (argc != 9) return 64;
-    helper = argv[8];
+    if (argc != 9 && argc != 10) return 64;
+    helper = argv[argc - 1];
+    if (argc == 10) runtime = argv[8];
 #else
-    if (argc != 8) return 64;
+    if (argc != 8 && argc != 9) return 64;
+    if (argc == 9) runtime = argv[8];
 #endif
     char *end;
     seconds = (unsigned)strtoul(argv[1], &end, 10);
-    if (*end || !seconds || seconds > 3600) return 64;
+    if (*end || (!seconds && !runtime) || seconds > 3600 || (runtime && seconds)) return 64;
     stock_worker = (pid_t)strtol(argv[2], &end, 10); if (*end || stock_worker < 2) return 64;
     stock_clock = strtoull(argv[3], &end, 10); if (*end || !stock_clock) return 64;
     player = (pid_t)strtol(argv[4], &end, 10); if (*end || player < 2) return 64;
     player_clock = strtoull(argv[5], &end, 10); if (*end || !player_clock) return 64;
     guard_path = argv[6]; guard_sha = argv[7];
     if (guard_path[0] != '/' || strlen(guard_sha) != 64 || strspn(guard_sha, "0123456789abcdef") != 64) return 64;
-    signal(SIGTERM, signal_stop); signal(SIGINT, signal_stop); signal(SIGHUP, signal_stop);
+    if (runtime) {
+        char path[1024]; struct stat st;
+        if (runtime[0] != '/' || strlen(runtime) > 800 || lstat(runtime, &st) ||
+                !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 022)) return 64;
+        snprintf(path, sizeof(path), "%s/lock", runtime);
+        lock_fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB)) return 1;
+        snprintf(path, sizeof(path), "%s/control", runtime);
+        if (unlink(path) && errno != ENOENT) return 1;
+        if (mkfifo(path, 0600)) return 1;
+        fifo_fd = open(path, O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        if (fifo_fd < 0) return 1;
+    }
+    signal(SIGTERM, signal_stop); signal(SIGINT, signal_stop);
+    signal(SIGHUP, runtime ? SIG_IGN : signal_stop);
     signal(SIGPIPE, SIG_IGN);
     int control[2], ready[2];
     if (pipe2(control, O_CLOEXEC) || pipe2(ready, O_CLOEXEC)) return 1;
@@ -345,6 +562,7 @@ int main(int argc, char **argv) {
     if (wd < 0) return 1;
     if (!wd) {
         close(control[1]); close(ready[0]);
+        if (fifo_fd >= 0) close(fifo_fd);
         _exit(watchdog(control[0], ready[1]));
     }
     close(control[0]); close(ready[1]); char armed;
@@ -353,10 +571,14 @@ int main(int argc, char **argv) {
     else ok = 0;
     double deadline = now() + seconds;
     int status;
-    while (ok && !interrupted && now() < deadline) {
+    while (ok && !interrupted && (runtime || now() < deadline)) {
         pid_t result = waitpid(wd, &status, WNOHANG);
         if (result == wd) { close(control[1]); return WIFEXITED(status) ? WEXITSTATUS(status) : 3; }
         if (result < 0) break;
+        if (runtime) {
+            char action;
+            if (read(fifo_fd, &action, 1) == 1 && action == 'S') break;
+        }
         usleep(100000);
     }
     close(control[1]); /* also closes automatically on SIGKILL/controller death */
